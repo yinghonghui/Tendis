@@ -19,7 +19,7 @@ namespace tendisplus {
 
 using asio::ip::tcp;
 
-#ifdef TENDIS_DEBUG
+#if defined(TENDIS_DEBUG) && !defined(_WIN32)
 void printShellResult(std::string cmd) {
   string cmdFull = cmd + " 2>&1";
   char buffer[1024];
@@ -36,9 +36,9 @@ void printPortRunningInfo(uint32_t port) {
   string err = "running process info for port " + to_string(port) + ":";
   std::cerr << err.c_str();
   LOG(ERROR) << err;
-  string cmdPid = "pid=`lsof -i:" + to_string(port) +
-                   "|tail -1|awk '{print $2}'`;";
-  printShellResult("netstat |grep "+ to_string(port));
+  string cmdPid =
+    "pid=`lsof -i:" + to_string(port) + "|tail -1|awk '{print $2}'`;";
+  printShellResult("netstat |grep " + to_string(port));
   printShellResult("lsof -i:" + to_string(port));
   printShellResult(cmdPid + "ls -l /proc/$pid/exe");
   printShellResult(cmdPid + "ls -l /proc/$pid/cwd");
@@ -155,14 +155,20 @@ std::unique_ptr<BlockingTcpClient> NetworkAsio::createBlockingClient(
 }
 
 std::unique_ptr<BlockingTcpClient> NetworkAsio::createBlockingClient(
-  asio::ip::tcp::socket socket, size_t readBuf, uint64_t rateLimit) {
+  asio::ip::tcp::socket socket,
+  size_t readBuf,
+  uint64_t rateLimit,
+  uint32_t netBatchTimeoutSec) {
+  if (netBatchTimeoutSec == 0) {
+    netBatchTimeoutSec =  _cfg->netBatchTimeoutSec;
+  }
   auto rwCtx = getRwCtx(socket);
   INVARIANT(rwCtx != nullptr);
   return std::move(std::make_unique<BlockingTcpClient>(rwCtx,
                                                        std::move(socket),
                                                        readBuf,
                                                        _cfg->netBatchSize,
-                                                       _cfg->netBatchTimeoutSec,
+                                                       netBatchTimeoutSec,
                                                        rateLimit));
 }
 
@@ -197,7 +203,7 @@ Status NetworkAsio::prepare(const std::string& ip,
       return {ErrorCodes::ERR_NETWORK, ec.message()};
     }
   } catch (std::exception& e) {
-#ifdef TENDIS_DEBUG
+#if defined(TENDIS_DEBUG) && !defined(_WIN32)
     printPortRunningInfo(port);
 #endif
     return {ErrorCodes::ERR_NETWORK, e.what()};
@@ -218,6 +224,7 @@ Expected<uint64_t> NetworkAsio::client2Session(
   LOG(INFO) << "new net session, id:" << sess->id() << ",connId:" << connId
             << ",from:" << sess->getRemoteRepr() << " client2Session";
   sess->getCtx()->setAuthed();
+  sess->getCtx()->setFlags(c->getFlags());
   sess->getCtx()->setReplOnly(migrateOnly);
   _server->addSession(sess);
   ++_netMatrix->connCreated;
@@ -257,7 +264,6 @@ void NetworkAsio::doAccept() {
     uint64_t newConnId = _connCreated.fetch_add(1, std::memory_order_relaxed);
     auto sess = std::make_shared<T>(
       _server, std::move(socket), newConnId, true, _netMatrix, _reqMatrix);
-    sess->setIoCtxId(index);
     DLOG(INFO) << "new net session, id:" << sess->id()
                << ",connId:" << newConnId << ",from:" << sess->getRemoteRepr()
                << " created";

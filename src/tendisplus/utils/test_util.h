@@ -12,6 +12,7 @@
 #include <set>
 #include <string>
 #include <thread>  // NOLINT
+#include <utility>
 
 #include "asio.hpp"
 #include "tendisplus/server/server_entry.h"
@@ -38,6 +39,29 @@ using TestSession = std::shared_ptr<NetSession>;
 using KeysWritten = std::set<std::string>;
 using AllKeys = std::vector<KeysWritten>;
 
+class NoSchedNetSession : public NetSession {
+ public:
+  NoSchedNetSession(std::shared_ptr<ServerEntry> server,
+                    asio::ip::tcp::socket sock,
+                    uint64_t connid,
+                    bool initSock,
+                    std::shared_ptr<NetworkMatrix> netMatrix,
+                    std::shared_ptr<RequestMatrix> reqMatrix)
+    : NetSession(
+        server, std::move(sock), connid, initSock, netMatrix, reqMatrix) {
+    // fake this flag as true, it can send nothing to the client
+    _isSendRunning = true;
+  }
+
+ protected:
+  virtual void schedule() {}
+
+ public:
+  // cmd using AOF format
+  void setArgsFromAof(const std::string& cmd);
+  virtual std::vector<std::string> getResponse();
+};
+
 bool setupEnv();
 void destroyEnv();
 bool setupEnv(const std::string& v);
@@ -53,8 +77,12 @@ std::shared_ptr<NetSession> makeSession(std::shared_ptr<ServerEntry> server,
                                         std::shared_ptr<asio::io_context> ctx);
 
 void compareData(const std::shared_ptr<ServerEntry>& master,
-        const std::shared_ptr<ServerEntry>& slave,
-        bool comparebinlog = true);
+                 const std::shared_ptr<ServerEntry>& slave,
+                 bool comparebinlog = true);
+
+/* remain api to get command string of primary key */
+std::string getAofStr(const std::shared_ptr<ServerEntry>& svr,
+                      const RecordKey& v);
 
 bool setupReplEnv();
 void destroyReplEnv();
@@ -66,6 +94,9 @@ std::bitset<CLUSTER_SLOTS> genBitMap();
 
 void testExpire1(std::shared_ptr<ServerEntry> svr);
 void testExpire2(std::shared_ptr<ServerEntry> svr);
+void testExpireCommandWhenNoexpireTrue(std::shared_ptr<ServerEntry> svr);
+void testExpireKeyWhenGet(std::shared_ptr<ServerEntry> svr);
+void testExpireKeyWhenCompaction(std::shared_ptr<ServerEntry> svr);
 void testExpire(std::shared_ptr<ServerEntry> svr);
 void testKV(std::shared_ptr<ServerEntry> svr);
 void testMset(std::shared_ptr<ServerEntry> svr);
@@ -104,10 +135,12 @@ class WorkLoad {
                    uint32_t port,
                    const uint32_t cport = 0);
   void clusterNodes();
+  void clusterSlots();
   void addSlots(const std::string& slotsBuff);
   void replicate(const std::string& nodeName);
-  void manualFailover();
+  bool manualFailover();
   void lockDb(mstime_t locktime);
+  void sleep(mstime_t locktime);
   void stopMigrate(const std::string& taskid);
   void stopAllMigTasks();
   void restartAllMigTasks();

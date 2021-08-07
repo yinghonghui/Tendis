@@ -49,6 +49,9 @@ AllKeys initData(std::shared_ptr<ServerEntry>& server, uint32_t count) {
   auto list_keys = work.writeWork(RecordType::RT_LIST_META, count, 50);
   all_keys.emplace_back(list_keys);
 
+  // wait binlog dump to disk
+  std::this_thread::sleep_for(std::chrono::seconds(2));
+
   // #ifdef _WIN32
   work.flush();
   // #endif
@@ -208,6 +211,10 @@ TEST(Repl, Common) {
 #endif
     });
 
+    runCommand(master,
+               {"compactrange", "default", "3000", "9000", std::to_string(0)});
+    runCommand(master,
+               {"compactrange", "binlog", "0", "10000000", std::to_string(0)});
 
     std::this_thread::sleep_for(std::chrono::seconds(genRand() % 10 + 5));
     auto slave2 = makeAnotherSlave(slave2_dir, i, slave2_port, master_port);
@@ -220,11 +227,13 @@ TEST(Repl, Common) {
 
     sleep(2);  // wait recycle binlog
 
+    runCommand(master, {"compactrange", "data", "0", "10000"});
     waitSlaveCatchup(master, slave);
     compareData(master, slave);
 
     waitSlaveCatchup(master, slave1);
     compareData(master, slave1);
+    runCommand(master, {"compactrange", "binlog", "0", "100000000"});
 
     waitSlaveCatchup(master, slave2);
     compareData(master, slave2);
@@ -570,6 +579,92 @@ TEST(Repl, slaveofBenchmarkingMaster) {
     LOG(INFO) << ">>>>>> test store count:" << i << " end;";
   }
 }
+// TODO(wayenchen) test again when psynenable finish
+TEST(Repl, slaveofBenchmarkingMasterAOF) {
+  size_t i = 0;
+  {
+    LOG(INFO) << ">>>>>> test store count:" << i;
+
+    const auto guard = MakeGuard([] {
+      destroyEnv(master_dir);
+      destroyEnv(slave_dir);
+      std::this_thread::sleep_for(std::chrono::seconds(5));
+    });
+
+    EXPECT_TRUE(setupEnv(master_dir));
+    EXPECT_TRUE(setupEnv(slave_dir));
+
+    auto cfg1 = makeServerParam(master_port, i, master_dir, true);
+    auto cfg2 = makeServerParam(slave_port, i, slave_dir, true);
+    cfg1->aofEnabled = true;
+    cfg2->aofEnabled = true;
+    cfg1->psyncEnabled = true;
+    cfg2->psyncEnabled = true;
+
+    auto master = std::make_shared<ServerEntry>(cfg1);
+    auto s = master->startup(cfg1);
+    INVARIANT(s.ok());
+
+    auto slave = std::make_shared<ServerEntry>(cfg2);
+    s = slave->startup(cfg2);
+    INVARIANT(s.ok());
+
+    LOG(INFO) << ">>>>>> slaveof begin.";
+    runCmd(slave, {"slaveof", "127.0.0.1", std::to_string(master_port)});
+    std::this_thread::sleep_for(std::chrono::seconds(5));
+    LOG(INFO) << ">>>>>> slaveof end.";
+    LOG(INFO) << ">>>>>> master add data begin.";
+
+    auto thread = std::thread([this, master]() { testKV(master); });
+    std::this_thread::sleep_for(std::chrono::seconds(1));
+
+    asio::io_context ioContext;
+    asio::ip::tcp::socket socket(ioContext);
+    NetSession sess(slave, std::move(socket), 1, false, nullptr, nullptr);
+    sess.setArgs({"set", "test", "1", "nx"});
+    auto expect = Command::runSessionCmd(&sess);
+    /* NOTE(wayenchen) only master client could write,others should fail*/
+    EXPECT_FALSE(expect.ok());
+    DLOG(INFO) << "write to slave should fail" << expect.status().toString();
+
+    thread.join();
+
+    std::this_thread::sleep_for(std::chrono::seconds(10));
+    compareData(master, slave, false);
+
+    auto thread2 = std::thread([this, master]() { testSet(master); });
+
+    sess.setArgs({"sadd", "settestkey", "one", "two", "three"});
+    expect = Command::runSessionCmd(&sess);
+    EXPECT_FALSE(expect.ok());
+
+    DLOG(INFO) << "write to slave should fail" << expect.status().toString();
+    thread2.join();
+    std::this_thread::sleep_for(std::chrono::seconds(10));
+    compareData(master, slave, false);
+
+    auto thread3 = std::thread([this, master]() { testHash1(master); });
+    std::this_thread::sleep_for(std::chrono::seconds(1));
+    for (uint32_t i = 0; i < 100; i++) {
+      sess.setArgs({"hset", "testHash", std::to_string(i), std::to_string(i)});
+      auto expect = Command::runSessionCmd(&sess);
+
+      EXPECT_FALSE(expect.ok());
+      DLOG(INFO) << "write to slave should fail" << expect.status().toString();
+    }
+
+    thread3.join();
+    std::this_thread::sleep_for(std::chrono::seconds(20));
+    compareData(master, slave, false);
+    LOG(INFO) << ">>>>>> compareData end.";
+
+#ifndef _WIN32
+    master->stop();
+    slave->stop();
+    ASSERT_EQ(slave.use_count(), 1);
+#endif
+  }
+}
 
 void checkBinlogKeepNum(std::shared_ptr<ServerEntry> svr, uint32_t num) {
   auto ctx = std::make_shared<asio::io_context>();
@@ -584,16 +679,25 @@ void checkBinlogKeepNum(std::shared_ptr<ServerEntry> svr, uint32_t num) {
     expect = Command::runSessionCmd(session.get());
     uint64_t binlogstart =
       Command::getInt64FromFmtLongLong(expect.value()).value();
+
+    session->setArgs({"binlogmeta", to_string(i)});
+    expect = Command::runSessionCmd(session.get());
+    string binlogmeta = expect.value();
+    string reg = "minbinlogid:" + std::to_string(binlogstart) + " ";
+    EXPECT_TRUE(binlogmeta.find(reg) != binlogmeta.npos);
+
     LOG(INFO) << "checkBinlogKeepNum, port:" << svr->getParams()->port
               << " store:" << i << " binlogpos:" << binlogpos
-              << " binlogstart:" << binlogstart << " num:" << num;
+              << " binlogstart:" << binlogstart << " num:" << num
+              << " binlogmeta:" << binlogmeta;
+
     // if data not full, binlogpos-binlogstart may be smaller than num.
     if (svr->getParams()->binlogDelRange == 1 ||
         svr->getParams()->binlogDelRange == 0) {
-      EXPECT_TRUE(binlogpos - binlogstart + 1 == num);
+      EXPECT_EQ(binlogpos - binlogstart + 1, num);
     } else {
-      EXPECT_TRUE(binlogpos - binlogstart + 1 <
-                  num + svr->getParams()->binlogDelRange);
+      EXPECT_LT(binlogpos - binlogstart + 1,
+                num + svr->getParams()->binlogDelRange);
     }
   }
 }
@@ -601,8 +705,8 @@ void checkBinlogKeepNum(std::shared_ptr<ServerEntry> svr, uint32_t num) {
 TEST(Repl, BinlogKeepNum_Test) {
   size_t i = 0;
   {
-    for (int j = 0; j < 2; j++) {
-      LOG(INFO) << ">>>>>> test store count:" << i;
+    for (int j = 0; j < 3; j++) {
+      LOG(INFO) << ">>>>>> test time:" << j;
       const auto guard = MakeGuard([] {
         destroyEnv(master_dir);
         destroyEnv(slave_dir);
@@ -635,7 +739,17 @@ TEST(Repl, BinlogKeepNum_Test) {
         cfg2->binlogDelRange = 5000;
         cfg3->binlogDelRange = 5000;
         cfg4->binlogDelRange = 5000;
+        cfg1->compactRangeAfterDeleteRange = true;
+      } else if (j == 2) {
+        cfg1->binlogDelRange = 5000;
+        cfg2->binlogDelRange = 5000;
+        cfg3->binlogDelRange = 5000;
+        cfg4->binlogDelRange = 5000;
+        cfg1->deleteFilesInRangeforBinlog = true;
       }
+
+      // NOTE(takenliu) be care of gParams set by cfg1.
+      gParams = cfg1;
 
       auto master = std::make_shared<ServerEntry>(cfg1);
       auto s = master->startup(cfg1);
@@ -704,7 +818,7 @@ TEST(Repl, BinlogKeepNum_Test) {
       ASSERT_EQ(single.use_count(), 1);
 #endif
 
-      LOG(INFO) << ">>>>>> test store count:" << i << " end;";
+      LOG(INFO) << ">>>>>> test time:" << j << " end;";
     }
   }
 }
@@ -789,7 +903,16 @@ Status scan(const std::string& logfile) {
       continue;
     }
 
+    if (id != logkey.value().getBinlogId() &&
+        logValue.value().getCmd() == "flushalldisk") {
+      LOG(INFO) << "flushalldisk reset id, id:" << id
+                << " logkey:" << logkey.value().getBinlogId();
+      id = logkey.value().getBinlogId();
+    }
+
     if (id != logkey.value().getBinlogId()) {
+      LOG(ERROR) << "id:" << id << " logkey:" << logkey.value().getBinlogId()
+                 << " cmd:" << logValue.value().getCmd();
       fclose(pf);
       return {ErrorCodes::ERR_INTERNAL, "binlogId error."};
     }
@@ -805,8 +928,11 @@ TEST(Repl, coreDumpWhenSaveBinlog) {
   size_t i = 0;
   {
     LOG(INFO) << ">>>>>> test store count:" << i;
-    const auto guard = MakeGuard([] {
-      destroyEnv(single_dir2);
+    bool clear = false;  // dont clear if failed
+    const auto guard = MakeGuard([clear] {
+      if (clear) {
+        destroyEnv(single_dir2);
+      }
       std::this_thread::sleep_for(std::chrono::seconds(5));
     });
 
@@ -869,9 +995,9 @@ TEST(Repl, coreDumpWhenSaveBinlog) {
     checkBinlogKeepNum(single, masterBinlogNum);
 
 #ifndef _WIN32
-      single->stop();
+    single->stop();
 
-      ASSERT_EQ(single.use_count(), 1);
+    ASSERT_EQ(single.use_count(), 1);
 #endif
 
     sleep(2);
@@ -895,7 +1021,7 @@ TEST(Repl, coreDumpWhenSaveBinlog) {
         auto s = scan(path.string());
         if (!s.ok()) {
           LOG(ERROR) << "scan failed:" << s.toString()
-            << " file:" << path.string();
+                     << " file:" << path.string();
         }
         EXPECT_TRUE(s.ok());
       }
@@ -904,7 +1030,7 @@ TEST(Repl, coreDumpWhenSaveBinlog) {
       EXPECT_TRUE(0);
       return;
     }
-
+    clear = true;
     LOG(INFO) << ">>>>>> test store count:" << i << " end;";
   }
 }

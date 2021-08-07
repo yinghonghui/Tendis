@@ -1,8 +1,7 @@
 start_server {tags {"scan"}} {
     test "SCAN basic" {
         r flushdb
-        r debug populate 1000
-
+        debugPopulateKeys r 1000
         set cur 0
         set keys {}
         while 1 {
@@ -12,15 +11,14 @@ start_server {tags {"scan"}} {
             lappend keys {*}$k
             if {$cur == 0} break
         }
-
+       
         set keys [lsort -unique $keys]
         assert_equal 1000 [llength $keys]
     }
 
     test "SCAN COUNT" {
         r flushdb
-        r debug populate 1000
-
+        debugPopulateKeys r 1000
         set cur 0
         set keys {}
         while 1 {
@@ -37,7 +35,7 @@ start_server {tags {"scan"}} {
 
     test "SCAN MATCH" {
         r flushdb
-        r debug populate 1000
+        debugPopulateKeys r 1000
 
         set cur 0
         set keys {}
@@ -53,41 +51,189 @@ start_server {tags {"scan"}} {
         assert_equal 100 [llength $keys]
     }
 
-    foreach enc {intset hashtable} {
-        test "SSCAN with encoding $enc" {
-            # Create the Set
-            r del set
-            if {$enc eq {intset}} {
-                set prefix ""
-            } else {
-                set prefix "ele:"
-            }
-            set elements {}
-            for {set j 0} {$j < 100} {incr j} {
-                lappend elements ${prefix}${j}
-            }
-            r sadd set {*}$elements
+    test "SCAN SLOTS" {
+        r flushdb
+        debugPopulateKeys r 1000 string key 1
+        debugPopulateKeys r 500 string val 1
 
-            # Verify that the encoding matches.
-            assert {[r object encoding set] eq $enc}
+        set key_hash [::redis_cluster::hash key]
+        set val_hash [::redis_cluster::hash val]
 
-            # Test SSCAN
-            set cur 0
-            set keys {}
-            while 1 {
-                set res [r sscan set $cur]
-                set cur [lindex $res 0]
-                set k [lindex $res 1]
-                lappend keys {*}$k
-                if {$cur == 0} break
-            }
-
-            set keys [lsort -unique $keys]
-            assert_equal 100 [llength $keys]
+        # scan slots for {key} => slotA
+        set cur 0
+        set keys {}
+        while 1 {
+            set res [r scan $cur slots $key_hash]
+            set cur [lindex $res 0]
+            set k [lindex $res 1]
+            lappend keys {*}$k
+            if {$cur == 0} break
         }
+
+        set keys [lsort -unique $keys]
+        assert_equal 1000 [llength $keys]
+
+        # scan slots for {val} => slotB
+        set cur 0
+        set keys {}
+        while 1 {
+            set res [r scan $cur slots $val_hash]
+            set cur [lindex $res 0]
+            set k [lindex $res 1]
+            lappend keys {*}$k
+            if {$cur == 0} break
+        }
+
+        set keys [lsort -unique $keys]
+        assert_equal 500 [llength $keys]
+
+        #scan slots for {key/val}-{val/key} => slotA-slotB
+        if {$key_hash < $val_hash} {
+            set slots_range "$key_hash-$val_hash"
+        } else {
+            set slots_range "$val_hash-$key_hash"
+        }
+        set cur 0
+        set keys {}
+        while 1 {
+            set res [r scan $cur slots $slots_range]
+            set cur [lindex $res 0]
+            set k [lindex $res 1]
+            lappend keys {*}$k
+            if {$cur == 0} break
+        }
+
+        set keys [lsort -unique $keys]
+        assert_equal 1500 [llength $keys]
     }
 
-    foreach enc {ziplist hashtable} {
+    test "SCAN EMPTY" {
+        r flushdb
+
+        set cur 0
+        set keys {}
+        while 1 {
+            set res [r scan $cur match "key:1??"]
+            set cur [lindex $res 0]
+            set k [lindex $res 1]
+            lappend keys {*}$k
+            if {$cur == 0} break
+        }
+
+        set keys [lsort -unique $keys]
+        assert_equal 0 [llength $keys]
+    }
+
+    test "SCAN TYPE" {
+        r flushdb
+        
+        debugPopulateKeys r 1000 string
+        debugPopulateKeys r 100 list
+        debugPopulateKeys r 100 hash
+        debugPopulateKeys r 100 set
+        debugPopulateKeys r 100 zset
+ 
+        set cur 0
+        set keys {}
+        while 1 {
+            set res [r scan $cur type "string"]
+            set cur [lindex $res 0]
+            set k [lindex $res 1]
+            lappend keys {*}$k
+            if {$cur == 0} break
+        }
+
+        set keys [lsort -unique $keys]
+        assert_equal 1000 [llength $keys]
+
+        set cur 0
+        set keys {}
+        while 1 {
+            set res [r scan $cur type "list"]
+            set cur [lindex $res 0]
+            set k [lindex $res 1]
+            lappend keys {*}$k
+            if {$cur == 0} break
+        }
+
+        set keys [lsort -unique $keys]
+        assert_equal 100 [llength $keys]
+
+        set cur 0
+        set keys {}
+        while 1 {
+            set res [r scan $cur type "hash"]
+            set cur [lindex $res 0]
+            set k [lindex $res 1]
+            lappend keys {*}$k
+            if {$cur == 0} break
+        }
+
+        set keys [lsort -unique $keys]
+        assert_equal 100 [llength $keys]
+
+        set cur 0
+        set keys {}
+        while 1 {
+            set res [r scan $cur type "set"]
+            set cur [lindex $res 0]
+            set k [lindex $res 1]
+            lappend keys {*}$k
+            if {$cur == 0} break
+        }
+
+        set keys [lsort -unique $keys]
+        assert_equal 100 [llength $keys]
+
+        set cur 0
+        set keys {}
+        while 1 {
+            set res [r scan $cur type "zset"]
+            set cur [lindex $res 0]
+            set k [lindex $res 1]
+            lappend keys {*}$k
+            if {$cur == 0} break
+        }
+
+        set keys [lsort -unique $keys]
+        assert_equal 100 [llength $keys]
+    }
+
+    # foreach enc {intset hashtable} {
+    #     test "SSCAN with encoding $enc" {
+    #         # Create the Set
+    #         r del set
+    #         if {$enc eq {intset}} {
+    #             set prefix ""
+    #         } else {
+    #             set prefix "ele:"
+    #         }
+    #         set elements {}
+    #         for {set j 0} {$j < 100} {incr j} {
+    #             lappend elements ${prefix}${j}
+    #         }
+    #         r sadd set {*}$elements
+
+    #         # Verify that the encoding matches.
+    #         assert {[r object encoding set] eq $enc}
+
+    #         # Test SSCAN
+    #         set cur 0
+    #         set keys {}
+    #         while 1 {
+    #             set res [r sscan set $cur]
+    #             set cur [lindex $res 0]
+    #             set k [lindex $res 1]
+    #             lappend keys {*}$k
+    #             if {$cur == 0} break
+    #         }
+
+    #         set keys [lsort -unique $keys]
+    #         assert_equal 100 [llength $keys]
+    #     }
+    # }
+
+    foreach enc {hashtable} {
         test "HSCAN with encoding $enc" {
             # Create the Hash
             r del hash
@@ -127,7 +273,7 @@ start_server {tags {"scan"}} {
         }
     }
 
-    foreach enc {ziplist skiplist} {
+    foreach enc {skiplist} {
         test "ZSCAN with encoding $enc" {
             # Create the Sorted Set
             r del zset
@@ -169,7 +315,7 @@ start_server {tags {"scan"}} {
 
     test "SCAN guarantees check under write load" {
         r flushdb
-        r debug populate 100
+        debugPopulateKeys r 100
 
         # We start scanning here, so keys from 0 to 99 should all be
         # reported at the end of the iteration.

@@ -42,8 +42,6 @@ class RocksTxn : public Transaction {
   RocksTxn(const RocksTxn&) = delete;
   RocksTxn(RocksTxn&&) = delete;
   virtual ~RocksTxn();
-  std::unique_ptr<Cursor> createCursor(
-    ColumnFamilyNumber cf, const std::string* iterate_upper_bound = NULL) final;
 #ifdef BINLOG_V1
   std::unique_ptr<BinlogCursor> createBinlogCursor(
     uint64_t begin, bool ignoreReadBarrier) final;
@@ -68,6 +66,8 @@ class RocksTxn : public Transaction {
                const std::string& val,
                const uint64_t ts = 0) final;
   Status delKV(const std::string& key, const uint64_t ts = 0) final;
+  Status setKVWithoutBinlog(const std::string& key,
+               const std::string& val) final;
   Status addDeleteRangeBinlog(const std::string& begin,
                               const std::string& end) final;
 #ifdef BINLOG_V1
@@ -106,6 +106,8 @@ class RocksTxn : public Transaction {
 
  protected:
   virtual void ensureTxn() {}
+  std::unique_ptr<Cursor> createCursor(ColumnFamilyNumber cf,
+      const std::string* iterate_upper_bound = NULL) final;
 
   uint64_t _txnId;
   uint64_t _binlogId;
@@ -187,6 +189,7 @@ class RocksKVCursor : public Cursor {
 
  private:
   std::unique_ptr<rocksdb::Iterator> _it;
+  bool _seeked;
 };
 
 typedef struct sstMetaData {
@@ -234,6 +237,12 @@ class RocksKVStore : public KVStore {
                                   const std::string& begin,
                                   const std::string& end);
   Status deleteRangeBinlog(uint64_t begin, uint64_t end);
+  Status deleteFilesInrange(rocksdb::ColumnFamilyHandle* column_family,
+                                  const std::string& begin,
+                                  const std::string& end);
+  Status saveMinBinlogId(uint64_t id, uint64_t ts, Transaction* txn = nullptr);
+
+  Status handleRocksdbError(rocksdb::Status s) const;
 
 #ifdef BINLOG_V1
   Status applyBinlog(const std::list<ReplLog>& txnLog, Transaction* txn) final;
@@ -273,12 +282,22 @@ class RocksKVStore : public KVStore {
     return _mode != KVStore::StoreMode::STORE_NONE;
   }
 
+#ifdef TENDIS_DEBUG
+  // for unit test
+  void setIgnoreRocksError() {
+    _ignoreRocksError = true;
+  }
+#endif
+
   // check whether there is any data in the store
   bool isEmpty(bool ignoreBinlog = false) const final;
   // check whether the store get do get/set operations
   bool isPaused() const final;
   bool enableRepllog() const {
     return _enableRepllog;
+  }
+  bool recoveryMode() const {
+    return _cfg->forceRecovery != 0;
   }
   Status pause() final;
   Status resume() final;
@@ -319,16 +338,26 @@ class RocksKVStore : public KVStore {
     return _cfg;
   }
 
-  bool getIntProperty(const std::string& property, uint64_t* value) const;
-  bool getProperty(const std::string& property, std::string* value) const;
+  bool getIntProperty(const std::string& property, uint64_t* value,
+      ColumnFamilyNumber cf = ColumnFamilyNumber::ColumnFamily_Default) const;
+  bool getProperty(
+    const std::string& property,
+    std::string* value,
+    ColumnFamilyNumber cf = ColumnFamilyNumber::ColumnFamily_Default) const;
   std::string getAllProperty() const override;
   std::string getStatistics() const override;
+  uint64_t getStatCountById(uint32_t id) const override;
+  uint64_t getStatCountByName(const std::string& name) const override;
   std::string getBgError() const override;
   Status recoveryFromBgError() override;
   void resetStatistics();
+  Status setOption(const std::string& option, int64_t value) override;
+  int64_t getOption(const std::string& option) override;
 
   Expected<VersionMeta> getVersionMeta() override;
   Expected<VersionMeta> getVersionMeta(const std::string& name) override;
+  Expected<std::vector<VersionMeta>>
+    getAllVersionMeta(Transaction *txn) override;
   Status setVersionMeta(const std::string& name,
                         uint64_t ts,
                         uint64_t version) override;
@@ -340,6 +369,28 @@ class RocksKVStore : public KVStore {
       return _cfHandles[0];
     } else {
       return _cfHandles[1];
+    }
+  }
+  rocksdb::ColumnFamilyHandle* getColumnFamilyHandle(
+      ColumnFamilyNumber cfNum) const {
+    if (cfNum == ColumnFamilyNumber::ColumnFamily_Default) {
+        return _cfHandles[0];
+    } else if (cfNum == ColumnFamilyNumber::ColumnFamily_Binlog) {
+      if (_cfg->binlogUsingDefaultCF == true) {
+        return _cfHandles[0];
+      } else {
+        return _cfHandles[1];
+      }
+    } else {
+      return _cfHandles[0];
+    }
+  }
+
+  ColumnFamilyNumber getBinlogColumnFamilyNumber() {
+    if (_cfg->binlogUsingDefaultCF == true) {
+      return ColumnFamilyNumber::ColumnFamily_Default;
+    } else {
+      return ColumnFamilyNumber::ColumnFamily_Binlog;
     }
   }
 
@@ -365,8 +416,8 @@ class RocksKVStore : public KVStore {
   // reopen again.
   bool _isPaused;
   bool _hasBackup;
-  bool _enableFilter;
   bool _enableRepllog;
+  bool _ignoreRocksError;
 
   KVStore::StoreMode _mode;
 
@@ -424,6 +475,7 @@ class RocksdbEnv {
     return _errCnt.load(memory_order_relaxed);
   }
   std::string getErrorString() const;
+  void clear();
   void resetError();
   void setError(rocksdb::BackgroundErrorReason reason, rocksdb::Status* error);
 

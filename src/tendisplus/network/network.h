@@ -74,7 +74,10 @@ class NetworkAsio {
   std::unique_ptr<BlockingTcpClient> createBlockingClient(
     size_t readBuf, uint64_t rateLimit = 0);
   std::unique_ptr<BlockingTcpClient> createBlockingClient(
-    asio::ip::tcp::socket, size_t readBuf, uint64_t rateLimit = 0);
+    asio::ip::tcp::socket,
+    size_t readBuf,
+    uint64_t rateLimit = 0,
+    uint32_t netBatchTimeoutSec = 0);
   Expected<uint64_t> client2Session(std::shared_ptr<BlockingTcpClient>,
                                     bool migrateOnly = false);
   Expected<std::shared_ptr<ClusterSession>> client2ClusterSession(
@@ -160,9 +163,6 @@ class NetSession : public Session {
 
   const std::vector<std::string>& getArgs() const;
   void setArgs(const std::vector<std::string>&);
-  void setIoCtxId(uint32_t id) {
-    _ioCtxId = id;
-  }
   enum class State {
     Created,
     DrainReqNet,
@@ -196,6 +196,7 @@ class NetSession : public Session {
   FRIEND_TEST(NetSession, drainReqInvalid);
   FRIEND_TEST(NetSession, Completed);
   FRIEND_TEST(Command, common);
+  friend class NoSchedNetSession;
 
   void processMultibulkBuffer();
   void processInlineBuffer();

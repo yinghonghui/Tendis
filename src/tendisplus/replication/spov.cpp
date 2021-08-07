@@ -98,7 +98,13 @@ Expected<BackupInfo> getBackupInfo(BlockingTcpClient* client,
 // send +OK
 void ReplManager::slaveStartFullsync(const StoreMeta& metaSnapshot) {
   LOG(INFO) << "store:" << metaSnapshot.id << " fullsync start";
-
+  /* NOTE(wayenchen):lastsyncTime && lastbinlogTs 
+        should be inited if fullsync to new master */
+  {
+    std::lock_guard<std::mutex> lk(_mutex);
+    _syncStatus[metaSnapshot.id]->lastSyncTime = getGmtUtcTime();
+    _syncStatus[metaSnapshot.id]->lastBinlogTs = 0;
+  }
   LocalSessionGuard sg(_svr.get());
   // NOTE(deyukong): there is no need to setup a guard to clean the temp ctx
   // since it's on stack
@@ -158,7 +164,8 @@ void ReplManager::slaveStartFullsync(const StoreMeta& metaSnapshot) {
   });
 
   // 3) require a blocking-client
-  client = std::move(createClient(metaSnapshot, _connectMasterTimeoutMs));
+  client = std::move(
+    createClient(metaSnapshot, _connectMasterTimeoutMs, CLIENT_MASTER));
   if (client == nullptr) {
     LOG(WARNING) << "startFullSync storeid:" << metaSnapshot.id
                  << " with: " << metaSnapshot.syncFromHost << ":"
@@ -309,6 +316,10 @@ void ReplManager::slaveStartFullsync(const StoreMeta& metaSnapshot) {
   newMeta = metaSnapshot.copy();
   newMeta->replState = ReplState::REPL_CONNECTED;
   newMeta->binlogId = bkInfo.getBinlogPos();
+  {
+    std::lock_guard<std::mutex> lk(_mutex);
+    _syncStatus[metaSnapshot.id]->fullsyncSuccTimes++;
+  }
 
   changeReplState(*newMeta, true);
   // NOTE(takenliu):should reset firstBinlogId to the MinBinlog,
@@ -341,6 +352,20 @@ void ReplManager::slaveChkSyncStatus(const StoreMeta& metaSnapshot) {
   if (!reconn) {
     return;
   }
+
+  if (_svr->getParams()->clusterEnabled) {
+    auto clusterMgr = _svr->getClusterMgr();
+    /* _myself may be nullptr because repl startup early than cluster */
+    if (clusterMgr && clusterMgr->getClusterState()
+            && clusterMgr->getClusterState()->getMyselfNode()
+            && !clusterMgr->getClusterState()->getMyselfNode()->isMasterOk()) {
+      LOG(ERROR) << "my master is marked as failed, no need reconn with: "
+                 << metaSnapshot.syncFromHost << ","
+                 << metaSnapshot.syncFromPort;
+      return;
+    }
+  }
+
   LOG(INFO) << "store:" << metaSnapshot.id
             << " reconn with:" << metaSnapshot.syncFromHost << ","
             << metaSnapshot.syncFromPort << "," << metaSnapshot.syncFromId;
@@ -359,8 +384,8 @@ void ReplManager::slaveChkSyncStatus(const StoreMeta& metaSnapshot) {
   });
 
 
-  std::shared_ptr<BlockingTcpClient> client =
-    std::move(createClient(metaSnapshot, _connectMasterTimeoutMs));
+  std::shared_ptr<BlockingTcpClient> client = std::move(
+    createClient(metaSnapshot, _connectMasterTimeoutMs, CLIENT_MASTER));
   if (client == nullptr) {
     errStr = errPrefix + "reconn master failed";
     return;
@@ -461,12 +486,12 @@ void ReplManager::slaveSyncRoutine(uint32_t storeId) {
 
   if (metaSnapshot->replState == ReplState::REPL_CONNECT) {
     slaveStartFullsync(*metaSnapshot);
-    nextSched = nextSched + std::chrono::seconds(3);
+    nextSched = SCLOCK::now() + std::chrono::seconds(3);
     return;
   } else if (metaSnapshot->replState == ReplState::REPL_CONNECTED ||
              metaSnapshot->replState == ReplState::REPL_ERR) {
     slaveChkSyncStatus(*metaSnapshot);
-    nextSched = nextSched + std::chrono::seconds(10);
+    nextSched = SCLOCK::now() + std::chrono::seconds(10);
     return;
   } else {
     INVARIANT(false);
@@ -517,11 +542,8 @@ Status ReplManager::applyRepllogV2(Session* sess,
       binlogTs = msSinceEpoch();
     }
   } else {
-    auto binlog = applySingleTxnV2(sess,
-                                   storeId,
-                                   logKey,
-                                   logValue,
-                                   BinlogApplyMode::KEEP_BINLOG_ID);
+    auto binlog = applySingleTxnV2(
+      sess, storeId, logKey, logValue, BinlogApplyMode::KEEP_BINLOG_ID);
     if (!binlog.ok()) {
       return binlog.status();
     } else {
@@ -615,16 +637,16 @@ void ReplManager::updateCurBinlogFs(uint32_t storeId,
   std::unique_lock<std::mutex> lk(_mutex);
   auto& v = _logRecycStatus[storeId];
   v->fileSize += written;
-  if (v->fileSize >= _cfg->binlogFileSizeMB * 1024 * 1024 ||
+  if (ts) {
+    v->timestamp = ts;
+  }
+  if (v->fileSize >= (uint64_t)_cfg->binlogFileSizeMB * 1024 * 1024 ||
       v->fileCreateTime + std::chrono::seconds(_cfg->binlogFileSecs) <=
         SCLOCK::now() ||
       changeNewFile || v->needNewFile) {
     if (v->fs) {
       v->fs->close();
       v->fs.reset();
-    }
-    if (ts) {
-      v->timestamp = ts;
     }
     v->needNewFile = false;
   }

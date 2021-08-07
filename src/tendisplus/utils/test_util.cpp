@@ -1,7 +1,6 @@
 // Copyright (C) 2020 THL A29 Limited, a Tencent company.  All rights reserved.
 // Please refer to the license text that comes with this tendis open source
 // project for additional information.
-
 #include <fstream>
 #include <utility>
 #include <memory>
@@ -21,6 +20,9 @@
 #include "tendisplus/utils/string.h"
 
 namespace tendisplus {
+
+Expected<std::string> key2Aof(Session* sess, const std::string& key);
+
 std::shared_ptr<ServerParams> makeServerParam(uint32_t port,
                                               uint32_t storeCnt,
                                               const std::string& dir,
@@ -284,8 +286,8 @@ bool isExpired(PStore store, const RecordKey& key, const RecordValue& value) {
   uint64_t currentTs = msSinceEpoch();
   // uint64_t currentTs = store->getCurrentTime();
   uint64_t ttl;
-  if (key.getRecordType() == RecordType::RT_DATA_META
-    && value.getRecordType() == RecordType::RT_KV) {
+  if (key.getRecordType() == RecordType::RT_DATA_META &&
+      value.getRecordType() == RecordType::RT_KV) {
     ttl = value.getTtl();
     if (ttl > 0 && ttl < currentTs) {
       // Expired
@@ -296,9 +298,21 @@ bool isExpired(PStore store, const RecordKey& key, const RecordValue& value) {
 }
 
 void compareData(const std::shared_ptr<ServerEntry>& master,
-        const std::shared_ptr<ServerEntry>& slave,
-        bool compare_binlog) {
+                 const std::shared_ptr<ServerEntry>& slave,
+                 bool compare_binlog) {
   INVARIANT(master->getKVStoreCount() == slave->getKVStoreCount());
+  bool aofMode =
+    master->getParams()->aofEnabled && slave->getParams()->aofEnabled;
+
+  asio::io_context ioContext;
+  asio::ip::tcp::socket socket(ioContext);
+  NoSchedNetSession sess1(
+    master, std::move(socket), 1, false, nullptr, nullptr);
+
+  asio::io_context ioContext2;
+  asio::ip::tcp::socket socket2(ioContext2);
+  NoSchedNetSession sess2(
+    slave, std::move(socket2), 1, false, nullptr, nullptr);
 
   for (size_t i = 0; i < master->getKVStoreCount(); i++) {
     uint64_t count1 = 0;
@@ -322,29 +336,43 @@ void compareData(const std::shared_ptr<ServerEntry>& master,
       }
       INVARIANT(exptRcd1.ok());
 
-      if (isExpired(kvstore1, exptRcd1.value().getRecordKey(),
-        exptRcd1.value().getRecordValue())) {
+      auto masterKey = exptRcd1.value().getRecordKey();
+      if (isExpired(kvstore1, masterKey, exptRcd1.value().getRecordValue())) {
         continue;
       }
 
       count1++;
 
-      auto type = exptRcd1.value().getRecordKey().getRecordType();
-      auto key = exptRcd1.value().getRecordKey();
-      auto exptRcdv2 =
-              kvstore2->getKV(exptRcd1.value().getRecordKey(), txn2.get());
+      auto type = masterKey.getRecordType();
+      /* AOF PSYNC only compare primary keys*/
+      if (aofMode && type != RecordType::RT_DATA_META) {
+        continue;
+      }
+
+      auto exptRcdv2 = kvstore2->getKV(masterKey, txn2.get());
       EXPECT_TRUE(exptRcdv2.ok());
       if (!exptRcdv2.ok()) {
-        LOG(INFO) << "key:" << key.getPrimaryKey()
+        LOG(INFO) << "key:" << masterKey.getPrimaryKey()
                   << ",type:" << static_cast<int>(type) << " not found!";
         INVARIANT(0);
       }
       EXPECT_TRUE(exptRcdv2.ok());
-      EXPECT_EQ(exptRcd1.value().getRecordValue(), exptRcdv2.value());
+
+      if (aofMode) {
+        auto keystr1 = key2Aof(&sess1, masterKey.getPrimaryKey());
+        EXPECT_TRUE(keystr1.ok());
+
+        auto keystr2 = key2Aof(&sess2, masterKey.getPrimaryKey());
+        EXPECT_TRUE(keystr2.ok());
+
+        EXPECT_EQ(keystr1.value(), keystr2.value());
+      } else {
+        EXPECT_EQ(exptRcd1.value().getRecordValue(), exptRcdv2.value());
+      }
     }
     int count1_data = count1;
 
-    if (compare_binlog) {
+    if (compare_binlog && !aofMode) {
       // check the binlog
       auto cursor1_binlog = txn1->createBinlogCursor();
       while (true) {
@@ -356,7 +384,7 @@ void compareData(const std::shared_ptr<ServerEntry>& master,
         count1++;
 
         auto exptRcdv2 =
-                kvstore2->getKV(exptRcd1.value().getRecordKey(), txn2.get());
+          kvstore2->getKV(exptRcd1.value().getRecordKey(), txn2.get());
         EXPECT_TRUE(exptRcdv2.ok());
         EXPECT_EQ(exptRcd1.value().getRecordValue(), exptRcdv2.value());
       }
@@ -370,26 +398,40 @@ void compareData(const std::shared_ptr<ServerEntry>& master,
       }
       INVARIANT(exptRcd2.ok());
 
-      if (isExpired(kvstore2, exptRcd2.value().getRecordKey(),
-        exptRcd2.value().getRecordValue())) {
+      auto slaveKey = exptRcd2.value().getRecordKey();
+      if (isExpired(kvstore2, slaveKey, exptRcd2.value().getRecordValue())) {
         continue;
       }
       count2++;
 
+      if (aofMode && slaveKey.getRecordType() != RecordType::RT_DATA_META) {
+        continue;
+      }
+
       // check the data
-      auto exptRcdv1 =
-              kvstore1->getKV(exptRcd2.value().getRecordKey(), txn1.get());
+      auto exptRcdv1 = kvstore1->getKV(slaveKey, txn1.get());
       EXPECT_TRUE(exptRcdv1.ok());
       if (!exptRcdv1.ok()) {
         LOG(INFO) << exptRcd2.value().toString()
                   << " error:" << exptRcdv1.status().toString();
         continue;
       }
-      EXPECT_EQ(exptRcd2.value().getRecordValue(), exptRcdv1.value());
+      if (aofMode) {
+        auto keystr1 = key2Aof(&sess1, slaveKey.getPrimaryKey());
+        EXPECT_TRUE(keystr1.ok());
+
+        auto keystr2 = key2Aof(&sess2, slaveKey.getPrimaryKey());
+        EXPECT_TRUE(keystr2.ok());
+
+        EXPECT_EQ(keystr1.value(), keystr2.value());
+      } else {
+        EXPECT_EQ(exptRcd2.value().getRecordValue(), exptRcdv1.value());
+      }
     }
+
     int count2_data = count2;
 
-    if (compare_binlog) {
+    if (compare_binlog && !aofMode) {
       auto cursor2_binlog = txn2->createBinlogCursor();
       while (true) {
         Expected<Record> exptRcd2 = cursor2_binlog->next();
@@ -604,6 +646,13 @@ void WorkLoad::clusterNodes() {
   EXPECT_TRUE(expect.ok());
 }
 
+void WorkLoad::clusterSlots() {
+  _session->setArgs({"cluster", "slots"});
+
+  auto expect = Command::runSessionCmd(_session.get());
+  EXPECT_TRUE(expect.ok());
+}
+
 void WorkLoad::addSlots(const std::string& slotsBuff) {
   _session->setArgs({"cluster", "addslots", slotsBuff});
 
@@ -624,10 +673,19 @@ void WorkLoad::lockDb(mstime_t locktime) {
   EXPECT_TRUE(expect.ok());
 }
 
-void WorkLoad::manualFailover() {
-    _session->setArgs({"cluster", "failover", "takeover"});
-    auto expect = Command::runSessionCmd(_session.get());
-    EXPECT_TRUE(expect.ok());
+void WorkLoad::sleep(mstime_t locktime) {
+  _session->setArgs({"tendisadmin", "sleep", std::to_string(locktime)});
+  auto expect = Command::runSessionCmd(_session.get());
+  EXPECT_TRUE(expect.ok());
+}
+
+bool WorkLoad::manualFailover() {
+  _session->setArgs({"cluster", "failover"});
+  auto expect = Command::runSessionCmd(_session.get());
+  if (expect.ok()) {
+    return true;
+  }
+  return false;
 }
 
 void WorkLoad::stopMigrate(const std::string& taskid) {
@@ -2718,6 +2776,307 @@ void testExpire2(std::shared_ptr<ServerEntry> svr) {
   }
 }
 
+void testExpireCommandWhenNoexpireTrue(std::shared_ptr<ServerEntry> svr) {
+  asio::io_context ioContext;
+  asio::ip::tcp::socket socket(ioContext), socket1(ioContext);
+  NetSession sess(svr, std::move(socket), 1, false, nullptr, nullptr);
+
+  sess.setArgs({"config", "set", "noexpire", "no"});
+  auto expect = Command::runSessionCmd(&sess);
+  EXPECT_TRUE(expect.ok());
+  EXPECT_EQ(expect.value(), Command::fmtOK());
+
+  sess.setArgs({"set", "key", "xxx", "PX", std::to_string(1)});
+  expect = Command::runSessionCmd(&sess);
+  EXPECT_TRUE(expect.ok());
+  EXPECT_EQ(expect.value(), Command::fmtOK());
+
+  std::this_thread::sleep_for(std::chrono::milliseconds(10));
+
+  sess.setArgs({"expire", "key", std::to_string(1)});
+  expect = Command::runSessionCmd(&sess);
+  EXPECT_TRUE(expect.ok());
+  EXPECT_EQ(expect.value(), Command::fmtZero());
+
+  sess.setArgs({"config", "set", "noexpire", "yes"});
+  expect = Command::runSessionCmd(&sess);
+  EXPECT_TRUE(expect.ok());
+  EXPECT_EQ(expect.value(), Command::fmtOK());
+
+  sess.setArgs({"set", "key", "xxx", "PX", std::to_string(1)});
+  expect = Command::runSessionCmd(&sess);
+  EXPECT_TRUE(expect.ok());
+  EXPECT_EQ(expect.value(), Command::fmtOK());
+
+  std::this_thread::sleep_for(std::chrono::milliseconds(10));
+
+  sess.setArgs({"expire", "key", std::to_string(1)});
+  expect = Command::runSessionCmd(&sess);
+  EXPECT_TRUE(expect.ok());
+  EXPECT_EQ(expect.value(), Command::fmtOne());
+}
+
+void testExpireKeyWhenGet(std::shared_ptr<ServerEntry> svr) {
+  asio::io_context ioContext;
+  asio::ip::tcp::socket socket(ioContext), socket1(ioContext);
+  NetSession sess(svr, std::move(socket), 1, false, nullptr, nullptr);
+
+  sess.setArgs({"config", "set", "noexpire", "yes"});
+  auto expect = Command::runSessionCmd(&sess);
+  EXPECT_TRUE(expect.ok());
+  EXPECT_EQ(expect.value(), Command::fmtOK());
+
+  // string
+  sess.setArgs({"set", "key", "xxx", "PX", std::to_string(1)});
+  expect = Command::runSessionCmd(&sess);
+  EXPECT_TRUE(expect.ok());
+  EXPECT_EQ(expect.value(), Command::fmtOK());
+
+  // hash
+  sess.setArgs({"hset", "myhash", "k", "v"});
+  expect = Command::runSessionCmd(&sess);
+  EXPECT_TRUE(expect.ok());
+  EXPECT_EQ(expect.value(), Command::fmtOne());
+
+  sess.setArgs({"pexpire", "myhash", std::to_string(1)});
+  expect = Command::runSessionCmd(&sess);
+  EXPECT_TRUE(expect.ok());
+  EXPECT_EQ(expect.value(), Command::fmtOne());
+
+  // set
+  sess.setArgs({"sadd", "myset", "v"});
+  expect = Command::runSessionCmd(&sess);
+  EXPECT_TRUE(expect.ok());
+  EXPECT_EQ(expect.value(), Command::fmtOne());
+
+  sess.setArgs({"pexpire", "myset", std::to_string(1)});
+  expect = Command::runSessionCmd(&sess);
+  EXPECT_TRUE(expect.ok());
+  EXPECT_EQ(expect.value(), Command::fmtOne());
+
+  // zset
+  sess.setArgs({"zadd", "myzset", std::to_string(100), "k"});
+  expect = Command::runSessionCmd(&sess);
+  EXPECT_TRUE(expect.ok());
+  EXPECT_EQ(expect.value(), Command::fmtOne());
+
+  sess.setArgs({"pexpire", "myzset", std::to_string(1)});
+  expect = Command::runSessionCmd(&sess);
+  EXPECT_TRUE(expect.ok());
+  EXPECT_EQ(expect.value(), Command::fmtOne());
+
+  // list
+  sess.setArgs({"lpush", "mylist", "v"});
+  expect = Command::runSessionCmd(&sess);
+  EXPECT_TRUE(expect.ok());
+  EXPECT_EQ(expect.value(), Command::fmtOne());
+
+  sess.setArgs({"pexpire", "mylist", std::to_string(1)});
+  expect = Command::runSessionCmd(&sess);
+  EXPECT_TRUE(expect.ok());
+  EXPECT_EQ(expect.value(), Command::fmtOne());
+
+  std::this_thread::sleep_for(std::chrono::milliseconds(10));
+
+  // we can get expired key, if noexpire true
+  sess.setArgs({"get", "key"});
+  expect = Command::runSessionCmd(&sess);
+  EXPECT_TRUE(expect.ok());
+  EXPECT_EQ(expect.value(), Command::fmtBulk("xxx"));
+
+  sess.setArgs({"hget", "myhash", "k"});
+  expect = Command::runSessionCmd(&sess);
+  EXPECT_TRUE(expect.ok());
+  EXPECT_EQ(expect.value(), Command::fmtBulk("v"));
+
+  sess.setArgs({"smembers", "myset"});
+  expect = Command::runSessionCmd(&sess);
+  EXPECT_TRUE(expect.ok());
+  std::stringstream ss;
+  Command::fmtMultiBulkLen(ss, 1);
+  Command::fmtBulk(ss, "v");
+  EXPECT_EQ(expect.value(), ss.str());
+
+  sess.setArgs({"zrange", "myzset", "0", "-1"});
+  expect = Command::runSessionCmd(&sess);
+  EXPECT_TRUE(expect.ok());
+  ss.str("");
+  Command::fmtMultiBulkLen(ss, 1);
+  Command::fmtBulk(ss, "k");
+  EXPECT_EQ(expect.value(), ss.str());
+
+  sess.setArgs({"lindex", "mylist", "0"});
+  expect = Command::runSessionCmd(&sess);
+  EXPECT_TRUE(expect.ok());
+  EXPECT_EQ(expect.value(), Command::fmtBulk("v"));
+
+  // delete expired key when get
+  sess.setArgs({"config", "set", "noexpire", "no"});
+  expect = Command::runSessionCmd(&sess);
+  EXPECT_TRUE(expect.ok());
+  EXPECT_EQ(expect.value(), Command::fmtOK());
+
+  sess.setArgs({"get", "key"});
+  expect = Command::runSessionCmd(&sess);
+  EXPECT_TRUE(expect.ok());
+  EXPECT_EQ(expect.value(), Command::fmtNull());
+
+  sess.setArgs({"hget", "myhash", "k"});
+  expect = Command::runSessionCmd(&sess);
+  EXPECT_TRUE(expect.ok());
+  EXPECT_EQ(expect.value(), Command::fmtNull());
+
+  sess.setArgs({"smembers", "myset"});
+  expect = Command::runSessionCmd(&sess);
+  EXPECT_TRUE(expect.ok());
+  EXPECT_EQ(expect.value(), Command::fmtZeroBulkLen());
+
+  sess.setArgs({"zrange", "myzset", "0", "-1"});
+  expect = Command::runSessionCmd(&sess);
+  EXPECT_TRUE(expect.ok());
+  EXPECT_EQ(expect.value(), Command::fmtZeroBulkLen());
+
+  sess.setArgs({"lindex", "mylist", "0"});
+  expect = Command::runSessionCmd(&sess);
+  EXPECT_TRUE(expect.ok());
+  EXPECT_EQ(expect.value(), Command::fmtNull());
+}
+
+void testExpireKeyWhenCompaction(std::shared_ptr<ServerEntry> svr) {
+  asio::io_context ioContext;
+  asio::ip::tcp::socket socket(ioContext), socket1(ioContext);
+  NetSession sess(svr, std::move(socket), 1, false, nullptr, nullptr);
+
+  sess.setArgs({"config", "set", "noexpire", "yes"});
+  auto expect = Command::runSessionCmd(&sess);
+  EXPECT_TRUE(expect.ok());
+  EXPECT_EQ(expect.value(), Command::fmtOK());
+
+  // string
+  sess.setArgs({"set", "key", "xxx", "PX", std::to_string(1)});
+  expect = Command::runSessionCmd(&sess);
+  EXPECT_TRUE(expect.ok());
+  EXPECT_EQ(expect.value(), Command::fmtOK());
+
+  // hash
+  sess.setArgs({"hset", "myhash", "k", "v"});
+  expect = Command::runSessionCmd(&sess);
+  EXPECT_TRUE(expect.ok());
+  EXPECT_EQ(expect.value(), Command::fmtOne());
+
+  sess.setArgs({"pexpire", "myhash", std::to_string(1)});
+  expect = Command::runSessionCmd(&sess);
+  EXPECT_TRUE(expect.ok());
+  EXPECT_EQ(expect.value(), Command::fmtOne());
+
+  // set
+  sess.setArgs({"sadd", "myset", "v"});
+  expect = Command::runSessionCmd(&sess);
+  EXPECT_TRUE(expect.ok());
+  EXPECT_EQ(expect.value(), Command::fmtOne());
+
+  sess.setArgs({"pexpire", "myset", std::to_string(1)});
+  expect = Command::runSessionCmd(&sess);
+  EXPECT_TRUE(expect.ok());
+  EXPECT_EQ(expect.value(), Command::fmtOne());
+
+  // zset
+  sess.setArgs({"zadd", "myzset", std::to_string(100), "k"});
+  expect = Command::runSessionCmd(&sess);
+  EXPECT_TRUE(expect.ok());
+  EXPECT_EQ(expect.value(), Command::fmtOne());
+
+  sess.setArgs({"pexpire", "myzset", std::to_string(1)});
+  expect = Command::runSessionCmd(&sess);
+  EXPECT_TRUE(expect.ok());
+  EXPECT_EQ(expect.value(), Command::fmtOne());
+
+  // list
+  sess.setArgs({"lpush", "mylist", "v"});
+  expect = Command::runSessionCmd(&sess);
+  EXPECT_TRUE(expect.ok());
+  EXPECT_EQ(expect.value(), Command::fmtOne());
+
+  sess.setArgs({"pexpire", "mylist", std::to_string(1)});
+  expect = Command::runSessionCmd(&sess);
+  EXPECT_TRUE(expect.ok());
+  EXPECT_EQ(expect.value(), Command::fmtOne());
+
+  std::this_thread::sleep_for(std::chrono::milliseconds(10));
+
+  // we can get expired key, if noexpire true
+  sess.setArgs({"get", "key"});
+  expect = Command::runSessionCmd(&sess);
+  EXPECT_TRUE(expect.ok());
+  EXPECT_EQ(expect.value(), Command::fmtBulk("xxx"));
+
+  sess.setArgs({"hget", "myhash", "k"});
+  expect = Command::runSessionCmd(&sess);
+  EXPECT_TRUE(expect.ok());
+  EXPECT_EQ(expect.value(), Command::fmtBulk("v"));
+
+  sess.setArgs({"smembers", "myset"});
+  expect = Command::runSessionCmd(&sess);
+  EXPECT_TRUE(expect.ok());
+  std::stringstream ss;
+  Command::fmtMultiBulkLen(ss, 1);
+  Command::fmtBulk(ss, "v");
+  EXPECT_EQ(expect.value(), ss.str());
+
+  sess.setArgs({"zrange", "myzset", "0", "-1"});
+  expect = Command::runSessionCmd(&sess);
+  EXPECT_TRUE(expect.ok());
+  ss.str("");
+  Command::fmtMultiBulkLen(ss, 1);
+  Command::fmtBulk(ss, "k");
+  EXPECT_EQ(expect.value(), ss.str());
+
+  sess.setArgs({"lindex", "mylist", "0"});
+  expect = Command::runSessionCmd(&sess);
+  EXPECT_TRUE(expect.ok());
+  EXPECT_EQ(expect.value(), Command::fmtBulk("v"));
+
+
+  // delete expired key by compaction and indexMgr
+  sess.setArgs({"config", "set", "noexpire", "no"});
+  expect = Command::runSessionCmd(&sess);
+  EXPECT_TRUE(expect.ok());
+  EXPECT_EQ(expect.value(), Command::fmtOK());
+
+  for (const auto& store : svr->getStores()) {
+    store->fullCompact();
+  }
+  std::this_thread::sleep_for(
+    std::chrono::seconds(2 * svr->getParams()->pauseTimeIndexMgr));
+
+  // test if key exist
+  svr->getParams()->noexpire = true;
+  sess.setArgs({"get", "key"});
+  expect = Command::runSessionCmd(&sess);
+  EXPECT_TRUE(expect.ok());
+  EXPECT_EQ(expect.value(), Command::fmtNull());
+
+  sess.setArgs({"hget", "myhash", "k"});
+  expect = Command::runSessionCmd(&sess);
+  EXPECT_TRUE(expect.ok());
+  EXPECT_EQ(expect.value(), Command::fmtNull());
+
+  sess.setArgs({"smembers", "myset"});
+  expect = Command::runSessionCmd(&sess);
+  EXPECT_TRUE(expect.ok());
+  EXPECT_EQ(expect.value(), Command::fmtZeroBulkLen());
+
+  sess.setArgs({"zrange", "myzset", "0", "-1"});
+  expect = Command::runSessionCmd(&sess);
+  EXPECT_TRUE(expect.ok());
+  EXPECT_EQ(expect.value(), Command::fmtZeroBulkLen());
+
+  sess.setArgs({"lindex", "mylist", "0"});
+  expect = Command::runSessionCmd(&sess);
+  EXPECT_TRUE(expect.ok());
+  EXPECT_EQ(expect.value(), Command::fmtNull());
+}
+
 void testSync(std::shared_ptr<ServerEntry> svr) {
   auto fmtSyncVerRes = [](std::stringstream& ss, uint64_t ts, uint64_t ver) {
     ss.str("");
@@ -2832,8 +3191,30 @@ std::string runCommand(std::shared_ptr<ServerEntry> svr,
 
 void runBgCommand(std::shared_ptr<ServerEntry> svr) {
   runCommand(svr, {"info", "all"});
+  runCommand(svr, {"info", "levelstats"});
   runCommand(svr, {"client", "list"});
   runCommand(svr, {"show", "processlist", "all"});
+}
+
+void NoSchedNetSession::setArgsFromAof(const std::string& cmd) {
+  std::lock_guard<std::mutex> lk(_mutex);
+  _queryBuf.clear();
+  _args.clear();
+  std::copy(cmd.begin(), cmd.end(), std::back_inserter(_queryBuf));
+  _queryBufPos = _queryBuf.size();
+  processMultibulkBuffer();
+
+  INVARIANT_D(_args.size() > 0);
+}
+
+std::vector<std::string> NoSchedNetSession::getResponse() {
+  std::lock_guard<std::mutex> lk(_mutex);
+  std::vector<std::string> ret;
+  for (auto sb : _sendBuffer) {
+    ret.emplace_back(std::string(sb->buffer.data(), sb->buffer.size()));
+  }
+
+  return std::move(ret);
 }
 
 }  // namespace tendisplus

@@ -28,6 +28,8 @@
 #include "rocksdb/options.h"
 #include "rocksdb/iostats_context.h"
 #include "rocksdb/perf_context.h"
+#include "rocksdb/statistics.h"
+#include "rocksdb/convenience.h"
 
 #include "tendisplus/storage/rocks/rocks_kvstore.h"
 #include "tendisplus/storage/rocks/rocks_kvttlcompactfilter.h"
@@ -57,19 +59,20 @@ namespace tendisplus {
 #endif
 
 RocksKVCursor::RocksKVCursor(std::unique_ptr<rocksdb::Iterator> it)
-  : Cursor(), _it(std::move(it)) {
-  _it->Seek("");
-}
+  : Cursor(), _it(std::move(it)), _seeked(false) {}
 
 void RocksKVCursor::seek(const std::string& prefix) {
   _it->Seek(rocksdb::Slice(prefix.c_str(), prefix.size()));
+  _seeked = true;
 }
 
 void RocksKVCursor::seekToLast() {
   _it->SeekToLast();
+  _seeked = true;
 }
 
 Expected<Record> RocksKVCursor::next() {
+  INVARIANT(_seeked);
   if (!_it->status().ok()) {
     return {ErrorCodes::ERR_INTERNAL, _it->status().ToString()};
   }
@@ -89,6 +92,7 @@ Expected<Record> RocksKVCursor::next() {
 }
 
 Status RocksKVCursor::prev() {
+  INVARIANT(_seeked);
   if (!_it->status().ok()) {
     return {ErrorCodes::ERR_INTERNAL, _it->status().ToString()};
   }
@@ -103,6 +107,7 @@ Status RocksKVCursor::prev() {
 }
 
 Expected<std::string> RocksKVCursor::key() {
+  INVARIANT(_seeked);
   if (!_it->status().ok()) {
     return {ErrorCodes::ERR_INTERNAL, _it->status().ToString()};
   }
@@ -210,6 +215,12 @@ std::unique_ptr<Cursor> RocksTxn::createCursor(
   ColumnFamilyNumber column_family_num,
   const std::string* iterate_upper_bound) {
   rocksdb::ReadOptions readOpts;
+
+  // NOTE: If force_recovery != 0, ignore verify checksums
+  if (_store->recoveryMode()) {
+    readOpts.verify_checksums = false;
+  }
+
   RESET_PERFCONTEXT();
   if (iterate_upper_bound != NULL) {
     _strUpperBound = *iterate_upper_bound;
@@ -269,9 +280,12 @@ Expected<uint64_t> RocksTxn::commit() {
     uint16_t oriFlag = static_cast<uint16_t>(ReplFlag::REPL_GROUP_START) |
       static_cast<uint16_t>(ReplFlag::REPL_GROUP_END);
 
-    // DLOG(INFO) << "RocksTxn::commit() storeid:" << _store->dbId() << "
-    // binlogid:" << _binlogId;
-
+    std::string sessionStr = "";
+    if (_session && _session->getArgs().size() > 0) {
+      sessionStr = _session->getServerEntry()->getParams()->aofEnabled
+        ? _session->getSessionCmd()
+        : _session->getArgs()[0];
+    }
     ReplLogKeyV2 key(_binlogId);
     ReplLogValueV2 val(chunkId,
                        static_cast<ReplFlag>(oriFlag),
@@ -280,9 +294,7 @@ Expected<uint64_t> RocksTxn::commit() {
 #ifndef NO_VERSIONEP
                        _session ? _session->getCtx()->getVersionEP()
                                 : SessionCtx::VERSIONEP_UNINITED,
-                       (_session && _session->getArgs().size() > 0)
-                         ? _session->getArgs()[0]
-                         : "",
+                       sessionStr,
 #else
                        SessionCtx::VERSIONEP_UNINITED,
                        "",
@@ -297,7 +309,7 @@ Expected<uint64_t> RocksTxn::commit() {
                        val.encode(_replLogValues));
     if (!s.ok()) {
       binlogTxnId = Transaction::TXNID_UNINITED;
-      return {ErrorCodes::ERR_INTERNAL, s.ToString()};
+      return _store->handleRocksdbError(s);
     }
   }
   if (isReplOnly() && _binlogId != Transaction::TXNID_UNINITED) {
@@ -315,7 +327,7 @@ Expected<uint64_t> RocksTxn::commit() {
     if (s.IsBusy() || s.IsTryAgain()) {
       return {ErrorCodes::ERR_COMMIT_RETRY, s.ToString()};
     } else {
-      return {ErrorCodes::ERR_INTERNAL, s.ToString()};
+      return _store->handleRocksdbError(s);
     }
   }
 }
@@ -336,7 +348,7 @@ Status RocksTxn::rollback() {
   if (s.ok()) {
     return {ErrorCodes::ERR_OK, ""};
   } else {
-    return {ErrorCodes::ERR_INTERNAL, s.ToString()};
+    return _store->handleRocksdbError(s);
   }
 }
 
@@ -363,6 +375,11 @@ Expected<std::string> RocksTxn::getKV(const std::string& key) {
   rocksdb::ReadOptions readOpts;
   std::string value;
 
+  // NOTE: If force_recovery != 0, ignore verify checksums
+  if (_store->recoveryMode()) {
+    readOpts.verify_checksums = false;
+  }
+
   RESET_PERFCONTEXT();
   rocksdb::Status s;
   if (RecordKey::decodeType(key) == RecordType::RT_BINLOG) {
@@ -377,7 +394,7 @@ Expected<std::string> RocksTxn::getKV(const std::string& key) {
   if (s.IsNotFound()) {
     return {ErrorCodes::ERR_NOTFOUND, s.ToString()};
   }
-  return {ErrorCodes::ERR_INTERNAL, s.ToString()};
+  return _store->handleRocksdbError(s);
 }
 
 Status RocksTxn::setKV(const std::string& key,
@@ -391,7 +408,7 @@ Status RocksTxn::setKV(const std::string& key,
   // put data into default column family
   auto s = _txn->Put(key, val);
   if (!s.ok()) {
-    return {ErrorCodes::ERR_INTERNAL, s.ToString()};
+    return _store->handleRocksdbError(s);
   }
 
   if (_store->enableRepllog()) {
@@ -417,6 +434,17 @@ Status RocksTxn::setKV(const std::string& key,
   return {ErrorCodes::ERR_OK, ""};
 }
 
+Status RocksTxn::setKVWithoutBinlog(const std::string& key,
+                                    const std::string& val) {
+  RESET_PERFCONTEXT();
+  // put data into default column family
+  auto s = _txn->Put(key, val);
+  if (!s.ok()) {
+    return _store->handleRocksdbError(s);
+  }
+  return {ErrorCodes::ERR_OK, ""};
+}
+
 Status RocksTxn::delKV(const std::string& key, const uint64_t ts) {
   if (_replOnly) {
     return {ErrorCodes::ERR_INTERNAL, "txn is replOnly"};
@@ -430,7 +458,7 @@ Status RocksTxn::delKV(const std::string& key, const uint64_t ts) {
   }
 
   if (!s.ok()) {
-    return {ErrorCodes::ERR_INTERNAL, s.ToString()};
+    return _store->handleRocksdbError(s);
   }
 
   if (_store->enableRepllog()) {
@@ -527,17 +555,16 @@ Status RocksTxn::applyBinlog(const ReplLogValueEntryV2& logEntry) {
   RESET_PERFCONTEXT();
   switch (logEntry.getOp()) {
     case ReplOp::REPL_OP_SET: {
-      // TODO(vinchen): RecordKey::validate()
       auto s = _txn->Put(logEntry.getOpKey(), logEntry.getOpValue());
       if (!s.ok()) {
-        return {ErrorCodes::ERR_INTERNAL, s.ToString()};
+        return _store->handleRocksdbError(s);
       }
       break;
     }
     case ReplOp::REPL_OP_DEL: {
       auto s = _txn->Delete(logEntry.getOpKey());
       if (!s.ok()) {
-        return {ErrorCodes::ERR_INTERNAL, s.ToString()};
+        return _store->handleRocksdbError(s);
       }
       break;
     }
@@ -552,9 +579,7 @@ Status RocksTxn::applyBinlog(const ReplLogValueEntryV2& logEntry) {
         _store->deleteRangeWithoutBinlog(_store->getDataColumnFamilyHandle(),
                                          logEntry.getOpKey(),
                                          logEntry.getOpValue());
-      if (!s.ok()) {
-        return {ErrorCodes::ERR_INTERNAL, s.toString()};
-      }
+      RET_IF_ERR(s);
       break;
     }
     default:
@@ -581,7 +606,7 @@ Status RocksTxn::setBinlogKV(uint64_t binlogId,
   RESET_PERFCONTEXT();
   auto s = _txn->Put(_store->getBinlogColumnFamilyHandle(), logKey, logValue);
   if (!s.ok()) {
-    return {ErrorCodes::ERR_INTERNAL, s.ToString()};
+    return _store->handleRocksdbError(s);
   }
 
   return {ErrorCodes::ERR_OK, ""};
@@ -599,15 +624,10 @@ Status RocksTxn::setBinlogKV(const std::string& key, const std::string& value) {
   INVARIANT_D(_binlogId != Transaction::TXNID_UNINITED);
   logkey.value().setBinlogId(_binlogId);
 
-  // TODO(takenliu) in ReplLogValueV2, ReplFlag _txnId timestamp VersionEP cmd
-  // use who's ?
-  // TODO(takenliu) when migrating, binlog and set key value, how to set
-  // VersionEP ???
-
   auto s = _txn->Put(
     _store->getBinlogColumnFamilyHandle(), logkey.value().encode(), value);
   if (!s.ok()) {
-    return {ErrorCodes::ERR_INTERNAL, s.ToString()};
+    return _store->handleRocksdbError(s);
   }
   return {ErrorCodes::ERR_OK, ""};
 }
@@ -617,7 +637,7 @@ Status RocksTxn::delBinlog(const ReplLogRawV2& log) {
   auto s =
     _txn->Delete(_store->getBinlogColumnFamilyHandle(), log.getReplLogKey());
   if (!s.ok()) {
-    return {ErrorCodes::ERR_INTERNAL, s.ToString()};
+    return _store->handleRocksdbError(s);
   }
 
   return {ErrorCodes::ERR_OK, ""};
@@ -747,7 +767,7 @@ void RocksPesTxn::ensureTxn() {
 }
 
 Status rocksdbOptionsSet(rocksdb::Options& options,
-                         const std::string key,
+                         const std::string& key,
                          int64_t value) {  // NOLINT(runtime/references)
   // AdvancedColumnFamilyOptions
   if (key == "max_write_buffer_number") {
@@ -766,7 +786,7 @@ Status rocksdbOptionsSet(rocksdb::Options& options,
     options.memtable_whole_key_filtering = static_cast<bool>(value);
   }
 #endif
-  else if (key == "memtable_huge_page_size") { // NOLINT
+  else if (key == "memtable_huge_page_size") {  // NOLINT
     options.memtable_huge_page_size = static_cast<size_t>(value);
   } else if (key == "bloom_locality") {
     options.bloom_locality = static_cast<uint32_t>(value);
@@ -1055,7 +1075,7 @@ rocksdb::Options RocksKVStore::options() {
   options.max_open_files = -1;
   // if we have no 'empty reads', we can disable bottom
   // level's bloomfilters
-  options.optimize_filters_for_hits = false;
+  options.optimize_filters_for_hits = true;
   options.enable_thread_tracking = true;
   options.compression_per_level.resize(ROCKSDB_NUM_LEVELS);
   for (int i = 0; i < ROCKSDB_NUM_LEVELS; ++i) {
@@ -1095,12 +1115,13 @@ rocksdb::Options RocksKVStore::options() {
   options.table_factory.reset(
     rocksdb::NewBlockBasedTableFactory(table_options));
 
-  if (_enableFilter && dbId() != CATALOG_NAME) {
+  if (dbId() != CATALOG_NAME) {
     // setup the ttlcompactionfilter expect "catalog" db
     options.compaction_filter_factory.reset(
-      new KVTtlCompactionFilterFactory(this));
+      new KVTtlCompactionFilterFactory(this, _cfg));
   }
 
+  _env->clear();
   // background listener
   auto listener = std::make_shared<BackgroundErrorListener>(_env);
   options.listeners.push_back(listener);
@@ -1326,6 +1347,7 @@ Expected<bool> RocksKVStore::deleteBinlog(uint64_t start) {
   return true;
 }
 
+// [start, end]
 Expected<TruncateBinlogResult> RocksKVStore::truncateBinlogV2(
   uint64_t start,
   uint64_t end,
@@ -1338,7 +1360,7 @@ Expected<TruncateBinlogResult> RocksKVStore::truncateBinlogV2(
   //    << " getHighestBinlogId:" << getHighestBinlogId()
   //    << " start:"<<start <<" end:"<< end;
   TruncateBinlogResult result;
-  int ret = 0;
+  int err = 0;
   uint64_t ts = 0;
   uint64_t written = 0;
   uint64_t deleten = 0;
@@ -1348,14 +1370,84 @@ Expected<TruncateBinlogResult> RocksKVStore::truncateBinlogV2(
     INVARIANT_COMPARE_D(minBinlogid.value(), >=, start);
   }
 #endif
+  INVARIANT_COMPARE_D(start, <=, save);
+  if (start > save) {
+    LOG(WARNING) << "truncateBinlogV2 start:" << start << " > save:" << save
+                 << ", set save=start";
+    save = start;
+  }
+
   uint64_t nextStart;
   uint64_t nextSave;
-  auto cursor = txn->createRepllogCursorV2(save);
   nextStart = start;
   nextSave = save;
   uint64_t max_cnt = _cfg->truncateBinlogNum;
   uint64_t size = 0;
   uint64_t cur_ts = msSinceEpoch();
+
+  const auto guard = MakeGuard([this, &nextStart, &start, &ts, &txn] {
+    if (_cfg->saveMinBinlogId && nextStart != start) {
+      INVARIANT_D(ts != 0);
+      // NOTE(takenliu): as we keep at least one binlog,
+      //   so nextStart must be in db.
+      // NOTE(takenliu): be care of not in the same transaction.
+      saveMinBinlogId(nextStart, ts, txn);
+    }
+  });
+
+  // TODO(takenliu) change binlogDelRange scope to (1000, 1000000)
+  INVARIANT_D(_cfg->binlogDelRange >= 1);
+  // if binlogDelRange > 1 and needn't save binlog, use deleteRange quickly
+  if (fs == nullptr && _cfg->binlogDelRange > 1) {
+    uint64_t range_end = start + _cfg->binlogDelRange;
+    while (true) {
+      if (range_end - 1 > end || range_end - start > max_cnt) {
+        break;
+      }
+
+      auto cursor = txn->createRepllogCursorV2(range_end - 1);
+      auto explog = cursor->next();
+      if (!explog.ok()) {
+        return explog.status();
+      }
+      // NOTE(takenliu) binlogid maybe has lag, so we need check again.
+      if (explog.value().getBinlogId() > end) {
+        break;
+      }
+      uint64_t minKeepLogMs =
+        static_cast<uint64_t>(_cfg->minBinlogKeepSec) * 1000;
+      if (minKeepLogMs != 0 &&
+        explog.value().getTimestamp() >= cur_ts - minKeepLogMs) {
+        break;
+      }
+      ts = explog.value().getTimestamp();
+      DLOG(INFO) << "truncateBinlogV2 dbid:" << dbId()
+                 << " delete:" << nextStart << " to "
+                 << explog.value().getBinlogId()
+                 << " time:" << (cur_ts - ts) / 1000 << " sec ago.";
+
+      auto s = deleteRangeBinlog(nextStart, range_end);  // [start, end)
+      if (!s.ok()) {
+        LOG(ERROR) << "deleteRangeBinlog error:" << s.toString();
+        return s;
+      }
+      deleten += range_end - nextStart;
+      nextStart = range_end;
+      range_end = range_end + _cfg->binlogDelRange;
+    }
+    result.deleten = deleten;
+    result.written = written;
+    result.timestamp = ts;
+    result.newStart = nextStart;
+    nextSave = nextStart;
+    result.newSave = nextSave;
+    result.err = err;
+
+    return result;
+  }
+
+  // otherwise check binlog one by one, it will be much slower
+  auto cursor = txn->createRepllogCursorV2(save);
   while (true) {
     auto explog = cursor->next();
     if (!explog.ok()) {
@@ -1368,10 +1460,10 @@ Expected<TruncateBinlogResult> RocksKVStore::truncateBinlogV2(
     if (explog.value().getBinlogId() > end || size >= max_cnt) {
       break;
     }
-    ts = explog.value().getTimestamp();
     uint64_t minKeepLogMs =
       static_cast<uint64_t>(_cfg->minBinlogKeepSec) * 1000;
-    if (!tailSlave && minKeepLogMs != 0 && ts >= cur_ts - minKeepLogMs) {
+    if (!tailSlave && minKeepLogMs != 0 &&
+      explog.value().getTimestamp() >= cur_ts - minKeepLogMs) {
       break;
     }
 
@@ -1386,13 +1478,14 @@ Expected<TruncateBinlogResult> RocksKVStore::truncateBinlogV2(
         LOG(ERROR) << "saveBinlogV2 failed, break.";
         // NOTE(takenliu): maybe write part of explog, so the binlog file's last
         // binlog will be error. then we change a new binlog file.
-        ret = -1;
+        err = -1;
         break;
       }
       written += len;
     }
     nextSave = explog.value().getBinlogId() + 1;
-    if (_cfg->binlogDelRange == 1 || _cfg->binlogDelRange == 0) {
+    ts = explog.value().getTimestamp();
+    if (_cfg->binlogDelRange == 1) {
       DLOG(INFO) << "truncateBinlogV2 dbid:" << dbId()
                  << " delete:" << explog.value().getBinlogId()
                  << " time:" << (cur_ts - ts) / 1000 << " sec ago.";
@@ -1406,10 +1499,11 @@ Expected<TruncateBinlogResult> RocksKVStore::truncateBinlogV2(
       deleten++;
       nextStart = nextSave;
     } else if (nextSave - nextStart >= _cfg->binlogDelRange) {
-      DLOG(INFO) << "truncateBinlogV2 dbid:" << dbId() << " delete:" << start
-                 << " to " << explog.value().getBinlogId()
+      DLOG(INFO) << "truncateBinlogV2 dbid:" << dbId()
+                 << " delete:" << nextStart << " to "
+                 << explog.value().getBinlogId()
                  << " time:" << (cur_ts - ts) / 1000 << " sec ago.";
-      auto s = deleteRangeBinlog(start, nextSave);
+      auto s = deleteRangeBinlog(nextStart, nextSave);
       if (!s.ok()) {
         LOG(ERROR) << "deleteRangeBinlog error:" << s.toString();
         return s;
@@ -1424,7 +1518,7 @@ Expected<TruncateBinlogResult> RocksKVStore::truncateBinlogV2(
   result.timestamp = ts;
   result.newStart = nextStart;
   result.newSave = nextSave;
-  result.ret = ret;
+  result.err = err;
 
   return result;
 }
@@ -1473,7 +1567,6 @@ Status RocksKVStore::setLogObserver(std::shared_ptr<BinlogObserver> ob) {
 Status RocksKVStore::compactRange(ColumnFamilyNumber cf,
                                   const std::string* begin,
                                   const std::string* end) {
-  // TODO(vinchen): need lock_guard?
   auto compactionOptions = rocksdb::CompactRangeOptions();
   auto db = getBaseDB();
 
@@ -1501,7 +1594,7 @@ Status RocksKVStore::compactRange(ColumnFamilyNumber cf,
       compactionOptions, getBinlogColumnFamilyHandle(), sbegin, send);
   }
   if (!status.ok()) {
-    return {ErrorCodes::ERR_INTERNAL, status.getState()};
+    return handleRocksdbError(status);
   }
   return {ErrorCodes::ERR_OK, ""};
 }
@@ -1657,6 +1750,9 @@ Expected<uint64_t> RocksKVStore::restart(bool restore,
         return {ErrorCodes::ERR_INTERNAL, status.ToString()};
       }
       rocksdb::ReadOptions readOpts;
+      if (_cfg->forceRecovery) {
+        readOpts.verify_checksums = false;
+      }
       iter.reset(
         tmpDb->GetBaseDB()->NewIterator(readOpts, getDataColumnFamilyHandle()));
       binlog_iter.reset(tmpDb->GetBaseDB()->NewIterator(
@@ -1685,6 +1781,9 @@ Expected<uint64_t> RocksKVStore::restart(bool restore,
       }
       LOG(INFO) << "rocksdb Open sucess,id:" << dbId() << " dbname:" << dbname;
       rocksdb::ReadOptions readOpts;
+      if (_cfg->forceRecovery) {
+        readOpts.verify_checksums = false;
+      }
       iter.reset(
         tmpDb->GetBaseDB()->NewIterator(readOpts, getDataColumnFamilyHandle()));
       binlog_iter.reset(tmpDb->GetBaseDB()->NewIterator(
@@ -1806,8 +1905,8 @@ RocksKVStore::RocksKVStore(const std::string& id,
     _isRunning(false),
     _isPaused(false),
     _hasBackup(false),
-    _enableFilter(true),
     _enableRepllog(enableRepllog),
+    _ignoreRocksError(false),
     _mode(mode),
     _txnMode(txnMode),
     _optdb(nullptr),
@@ -1818,10 +1917,6 @@ RocksKVStore::RocksKVStore(const std::string& id,
     _highestVisible(Transaction::TXNID_UNINITED),
     _logOb(nullptr),
     _env(std::make_shared<RocksdbEnv>()) {
-  if (_cfg->noexpire) {
-    _enableFilter = false;
-  }
-
   Expected<uint64_t> s =
     restart(false, Transaction::MIN_VALID_TXNID, UINT64_MAX, flag);
   if (!s.ok()) {
@@ -1900,7 +1995,7 @@ Expected<BackupInfo> RocksKVStore::backup(const std::string& dir,
   if (mode == KVStore::BackupMode::BACKUP_CKPT ||
       mode == KVStore::BackupMode::BACKUP_CKPT_INTER) {
     rocksdb::Checkpoint* checkpoint = nullptr;
-    auto guard = MakeGuard([this, checkpoint]() {
+    auto guard = MakeGuard([this, &checkpoint]() {
       if (checkpoint) {
         delete checkpoint;
       }
@@ -2297,6 +2392,21 @@ Status RocksKVStore::setKV(const Record& kv, Transaction* txn) {
   return txn->setKV(pair.first, pair.second);
 }
 
+Status RocksKVStore::handleRocksdbError(rocksdb::Status s) const {
+  if (_cfg->forceRecovery == 0) {
+    if (s.IsCorruption()) {
+      /* NOTE(vinchen): If got Corruption errors from rocksdb, instance should
+       * coredump immediately, and trigger the failover of cluster */
+      LOG(ERROR) << "Get corruption error from rocksdb:" << s.ToString();
+      INVARIANT(0);
+    }
+  }
+
+  INVARIANT_D(_ignoreRocksError);
+  LOG(ERROR) << "Get unexpected error from rocksdb:" << s.ToString();
+  return {ErrorCodes::ERR_INTERNAL, s.ToString()};
+}
+
 Status RocksKVStore::setKV(const std::string& key,
                            const std::string& val,
                            Transaction* txn) {
@@ -2335,6 +2445,7 @@ Status RocksKVStore::deleteRange(const std::string& begin,
   return ret;
 }
 
+// [begin, end]
 Status RocksKVStore::deleteRangeWithoutBinlog(
   rocksdb::ColumnFamilyHandle* column_family,
   const std::string& begin,
@@ -2348,18 +2459,82 @@ Status RocksKVStore::deleteRangeWithoutBinlog(
     rocksdb::WriteOptions(), column_family, sBegin.ToString(), sEnd.ToString());
   if (!s.ok()) {
     LOG(ERROR) << "deleteRange failed:" << s.ToString();
-    return {ErrorCodes::ERR_INTERNAL, s.ToString()};
+    return handleRocksdbError(s);
   }
   return {ErrorCodes::ERR_OK, ""};
 }
 
+// [begin, end]
+Status RocksKVStore::deleteFilesInrange(
+        rocksdb::ColumnFamilyHandle* column_family,
+        const std::string& begin,
+        const std::string& end) {
+  rocksdb::Slice sBegin(begin);
+  rocksdb::Slice sEnd(end);
+  rocksdb::DB* db = getBaseDB();
+  auto s = rocksdb::DeleteFilesInRange(
+          db, column_family, &sBegin, &sEnd, true);
+  if (!s.ok()) {
+    LOG(ERROR) << "DeleteFilesInRange failed:" << s.ToString();
+    return handleRocksdbError(s);
+  }
+  return {ErrorCodes::ERR_OK, ""};
+}
+
+Status RocksKVStore::saveMinBinlogId(uint64_t id, uint64_t ts,
+        Transaction* txn) {
+  RecordKey key(REPLLOGKEYV2_META_CHUNKID,
+                REPLLOGKEYV2_META_DBID,
+                RecordType::RT_META,
+                "",
+                "");
+
+  std::string val;
+  val.resize(sizeof(uint64_t) + sizeof(uint64_t));
+  // binlogId
+  int64Encode(&val[0], id);
+  // ts
+  int64Encode(&val[0] + sizeof(uint64_t), ts);
+
+  RecordValue value(std::move(val), RecordType::RT_META, -1);
+
+  INVARIANT(txn != nullptr);
+  auto s = txn->setKVWithoutBinlog(key.encode(), value.encode());
+  if (!s.ok()) {
+    LOG(ERROR) << "setKV failed:" << s.toString();
+    return s;
+  }
+  return s;
+}
+
+// [begin, end)
 Status RocksKVStore::deleteRangeBinlog(uint64_t begin, uint64_t end) {
-  ReplLogKeyV2 beginKey(begin);
-  ReplLogKeyV2 endKey(end);
-  auto beginKeyStr = beginKey.encode();
-  auto endKeyStr = endKey.encode();
-  return deleteRangeWithoutBinlog(
-    getBinlogColumnFamilyHandle(), beginKeyStr, endKeyStr);
+  if (_cfg->deleteFilesInRangeforBinlog) {
+    ReplLogKeyV2 beginKey(0);  // begin always use 0
+    ReplLogKeyV2 endKey(end);
+    auto beginKeyStr = beginKey.encode();
+    auto endKeyStr = endKey.encode();
+    auto s = deleteFilesInrange(
+            getBinlogColumnFamilyHandle(), beginKeyStr, endKeyStr);
+    RET_IF_ERR(s);
+  } else {
+    ReplLogKeyV2 beginKey(0);  // begin always use 0
+    ReplLogKeyV2 endKey(end);
+    auto beginKeyStr = beginKey.encode();
+    auto endKeyStr = endKey.encode();
+    auto s = deleteRangeWithoutBinlog(
+            getBinlogColumnFamilyHandle(), beginKeyStr, endKeyStr);
+    RET_IF_ERR(s);
+
+    if (_cfg->compactRangeAfterDeleteRange) {
+      // NOTE(takenliu) if dont real delete,maybe cause performance problem
+      // for example: when server restart, in ReplManager::startup(),
+      //   getMinBinlog() will take a long time
+      return compactRange(getBinlogColumnFamilyNumber(),
+                          &beginKeyStr, &endKeyStr);
+    }
+  }
+  return {ErrorCodes::ERR_OK, ""};
 }
 
 void RocksKVStore::initRocksProperties() {
@@ -2422,10 +2597,12 @@ void RocksKVStore::initRocksProperties() {
 }
 
 bool RocksKVStore::getIntProperty(const std::string& property,
-                                  uint64_t* value) const {
+                                  uint64_t* value,
+                                  ColumnFamilyNumber cf) const {
   bool ok = false;
   if (_isRunning) {
-    ok = getBaseDB()->GetIntProperty(property, value);
+    ok =
+      getBaseDB()->GetIntProperty(getColumnFamilyHandle(cf), property, value);
     if (!ok) {
       LOG(WARNING) << "db:" << dbId() << " getProperty:" << property
                    << " failed";
@@ -2435,10 +2612,11 @@ bool RocksKVStore::getIntProperty(const std::string& property,
 }
 
 bool RocksKVStore::getProperty(const std::string& property,
-                               std::string* value) const {
+                               std::string* value,
+                               ColumnFamilyNumber cf) const {
   bool ok = false;
   if (_isRunning) {
-    ok = getBaseDB()->GetProperty(property, value);
+    ok = getBaseDB()->GetProperty(getColumnFamilyHandle(cf), property, value);
     if (!ok) {
       LOG(WARNING) << "db:" << dbId() << " getProperty:" << property
                    << " failed";
@@ -2481,6 +2659,32 @@ std::string RocksKVStore::getStatistics() const {
   }
 }
 
+uint64_t RocksKVStore::getStatCountById(uint32_t id) const {
+  if (_isRunning) {
+    return _stats->getTickerCount(id);
+  }
+  return 0;
+}
+
+uint64_t RocksKVStore::getStatCountByName(const std::string& name) const {
+  static std::map<std::string, rocksdb::Tickers> tickersNameMap = {
+    {"rocksdb.number.iter.skip", rocksdb::Tickers::NUMBER_ITER_SKIP},
+  };
+  if (tickersNameMap.find(name) != tickersNameMap.end()) {
+    return getStatCountById(tickersNameMap[name]);
+  }
+
+  if (name == "rocksdb.compaction-filter-count") {
+    return stat.compactFilterCount.load(memory_order_relaxed);
+  } else if (name == "rocksdb.compaction-kv-expired-count") {
+    return stat.compactKvExpiredCount.load(memory_order_relaxed);
+  }
+
+  INVARIANT_D(0);
+
+  return 0;
+}
+
 std::string RocksKVStore::getBgError() const {
   return _env->getErrorString();
 }
@@ -2492,10 +2696,9 @@ Status RocksKVStore::recoveryFromBgError() {
 #if ROCKSDB_MAJOR > 5 || (ROCKSDB_MAJOR == 5 && ROCKSDB_MINOR > 15)
   {
     std::lock_guard<std::mutex> lk(_mutex);
-    // TODO(takenliu): upgrade rocksdb to lastest stable version
     auto s = getBaseDB()->Resume();
     if (!s.ok()) {
-      return {ErrorCodes::ERR_INTERNAL, s.ToString()};
+      return handleRocksdbError(s);
     }
   }
   _env->resetError();
@@ -2506,6 +2709,40 @@ Status RocksKVStore::recoveryFromBgError() {
 #endif
 
   return {ErrorCodes::ERR_OK, ""};
+}
+
+Status RocksKVStore::setOption(const std::string& option, int64_t value) {
+  std::unordered_map<std::string, std::string> map;
+  if (option.substr(0, 6) != "rocks.") {
+    return {ErrorCodes::ERR_INTERNAL, option + "is not rocksdb option"};
+  }
+
+  static std::set<std::string> rocksdb_dynamic_options = {
+    "rocks.max_background_compactions", "rocks.max_open_files"};
+
+  if (rocksdb_dynamic_options.count(option) <= 0) {
+    return {ErrorCodes::ERR_INTERNAL, option + " can't change dynamically"};
+  }
+
+  auto real_option = option.substr(6, option.size() - 6);
+  map[real_option] = std::to_string(value);
+
+  auto s = getBaseDB()->SetDBOptions(map);
+  if (!s.ok()) {
+    return {ErrorCodes::ERR_INTERNAL, s.ToString()};
+  }
+
+  return {ErrorCodes::ERR_OK, ""};
+}
+
+int64_t RocksKVStore::getOption(const std::string& option) {
+  if (option == "rocks.max_background_compactions") {
+    return getBaseDB()->GetDBOptions().max_background_compactions;
+  } else if (option == "rocks.max_open_files") {
+    return getBaseDB()->GetDBOptions().max_open_files;
+  } else {
+    return -2;
+  }
 }
 
 void RocksKVStore::resetStatistics() {
@@ -2549,6 +2786,35 @@ Expected<VersionMeta> RocksKVStore::getVersionMeta(const std::string& name) {
     return meta.status();
   }
   return meta.value();
+}
+
+/**
+ * @brief get all version meta of this kv-store
+ * @param txn transaction on this kv-store
+ * @return vector contains all version meta of this kv-store
+ */
+Expected<std::vector<VersionMeta>> RocksKVStore::getAllVersionMeta(
+  Transaction* txn) {
+  auto cursor = txn->createVersionMetaCursor();
+  std::vector<VersionMeta> versionMeta;
+  RecordKey rk(
+    VersionMeta::CHUNKID, VersionMeta::DBID, RecordType::RT_META, "", "");
+  cursor->seek(rk.encode());
+  while (true) {
+    auto expRecord = cursor->next();
+
+    // iterate all over this kvstore version meta data or no data
+    if ((expRecord.status().code() == ErrorCodes::ERR_EXHAUST) ||
+        (expRecord.status().code() == ErrorCodes::ERR_NOTFOUND)) {
+      break;
+    }
+    RET_IF_ERR(expRecord.status());
+
+    auto record = expRecord.value();
+    versionMeta.emplace_back(record);
+  }
+
+  return versionMeta;
 }
 
 Status RocksKVStore::setVersionMeta(const std::string& name,
@@ -2691,6 +2957,18 @@ void RocksdbEnv::setError(rocksdb::BackgroundErrorReason reason,
   _rocksbgError = error;
   _bgError = error->ToString();
   _errCnt++;
+}
+
+void RocksdbEnv::clear() {
+  std::lock_guard<std::mutex> lk(_mutex);
+  _bgError = "";
+#if ROCKSDB_MAJOR > 5 || (ROCKSDB_MAJOR == 5 && ROCKSDB_MINOR > 15)
+  // do nothing
+#else
+  // TODO(vinchen): in rocksdb-5.13.4 there is no DB::Resume().
+  // We can only reset the bg_error_ in rocksdb.
+  _rocksbgError = nullptr;
+#endif
 }
 
 void RocksdbEnv::resetError() {

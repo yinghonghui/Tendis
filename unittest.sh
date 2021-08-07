@@ -1,4 +1,4 @@
-#!/bin/sh
+#!/bin/bash
 
 logfile=./unittest.log
 rm $logfile
@@ -11,7 +11,7 @@ function runOne() {
     cat $tmplog
     cat $tmplog >> $logfile
 
-    errcnt=`grep -E "Expected|FAILED" $logfile|wc -l`
+    errcnt=`grep -E "Expected|FAILED|Check failure stack trace|core dumped" $logfile|wc -l`
     if [ $errcnt -ne 0 ]; then
         grep -E "Expected|FAILED" $logfile
         exit $errcnt
@@ -44,3 +44,6 @@ runOne "./$dir/demangle_unittest"
 runOne "./$dir/stl_logging_unittest"
 runOne "./$dir/network_test"
 runOne "./$dir/rocks_kvstore_test"
+runOne "./$dir/script_test"
+runOne "./$dir/worker_pool_test"
+runOne "./$dir/utils_common_test"

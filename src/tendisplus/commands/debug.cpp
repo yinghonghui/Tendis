@@ -22,6 +22,9 @@
 #include <thread>  // NOLINT
 #include <chrono>  // NOLINT
 #include "glog/logging.h"
+#ifndef WIN32
+#include "jemalloc/jemalloc.h"
+#endif  // !WIN32
 #include "rapidjson/document.h"
 #include "rapidjson/prettywriter.h"
 #include "rapidjson/stringbuffer.h"
@@ -68,7 +71,6 @@ class KeysCommand : public Command {
     const std::vector<std::string>& args = sess->getArgs();
     auto pattern = args[1];
     bool allkeys = false;
-
     if (pattern == "*") {
       allkeys = true;
     }
@@ -92,6 +94,14 @@ class KeysCommand : public Command {
 
     auto ts = msSinceEpoch();
 
+    std::bitset<CLUSTER_SLOTS> checkSlots;
+    bool enableCluster = server->getParams()->clusterEnabled;
+    if (enableCluster) {
+      auto myself = server->getClusterMgr()->getClusterState()->getMyselfNode();
+      checkSlots = myself->nodeIsMaster() ? myself->getSlots()
+                                          : myself->getMaster()->getSlots();
+    }
+
     std::list<std::string> result;
     for (ssize_t i = 0; i < server->getKVStoreCount(); i++) {
       auto expdb =
@@ -102,16 +112,15 @@ class KeysCommand : public Command {
         }
         return expdb.status();
       }
+
       PStore kvstore = expdb.value().store;
-      auto ptxn = kvstore->createTransaction(sess);
+      auto ptxn = sess->getCtx()->createTransaction(kvstore);
       if (!ptxn.ok()) {
         return ptxn.status();
       }
-      std::unique_ptr<Transaction> txn = std::move(ptxn.value());
-      auto cursor = txn->createDataCursor();
+      auto cursor = ptxn.value()->createDataCursor();
 
       cursor->seek("");
-
       while (true) {
         Expected<Record> exptRcd = cursor->next();
         if (exptRcd.status().code() == ErrorCodes::ERR_EXHAUST) {
@@ -132,6 +141,11 @@ class KeysCommand : public Command {
         if (chunkId >= server->getSegmentMgr()->getChunkSize()) {
           break;
         }
+        // NOTE(wayenchen) ignore slot not belong to me
+        if (enableCluster && !checkSlots.test(chunkId)) {
+          continue;
+        }
+
         auto key = exptRcd.value().getRecordKey().getPrimaryKey();
 
         if (!allkeys &&
@@ -142,7 +156,7 @@ class KeysCommand : public Command {
 
         auto ttl = exptRcd.value().getRecordValue().getTtl();
         if (keyType != RecordType::RT_DATA_META ||
-            (!Command::noExpire() && ttl != 0 &&
+            (!server->getParams()->noexpire && ttl != 0 &&
              ttl < ts)) {  // skip the expired key
           continue;
         }
@@ -167,7 +181,7 @@ class KeysCommand : public Command {
 
 class DbsizeCommand : public Command {
  public:
-  DbsizeCommand() : Command("dbsize", "rF") {}
+  DbsizeCommand() : Command("dbsize", "rFs") {}
 
   ssize_t arity() const {
     return -1;
@@ -207,6 +221,15 @@ class DbsizeCommand : public Command {
 
     // TODO(vinchen): should use a faster way
     std::list<std::string> result;
+
+    std::bitset<CLUSTER_SLOTS> checkSlots;
+    bool enableCluster = server->getParams()->clusterEnabled;
+    if (enableCluster) {
+      auto myself = server->getClusterMgr()->getClusterState()->getMyselfNode();
+      checkSlots = myself->nodeIsMaster() ? myself->getSlots()
+                                          : myself->getMaster()->getSlots();
+    }
+
     for (ssize_t i = 0; i < server->getKVStoreCount(); i++) {
       auto expdb =
         server->getSegmentMgr()->getDb(sess, i, mgl::LockMode::LOCK_IS);
@@ -218,13 +241,17 @@ class DbsizeCommand : public Command {
       }
 
       PStore kvstore = expdb.value().store;
+      // NOTE(takenliu): dbsizeCmmand and flushallCommand has confliction,
+      //   so we use kvstore->createTransaction() instead of
+      //   getCtx()->createTransaction(),
+      //   see detail in: git issue #58
       auto ptxn = kvstore->createTransaction(sess);
       if (!ptxn.ok()) {
         return ptxn.status();
       }
-      std::unique_ptr<Transaction> txn = std::move(ptxn.value());
-      auto cursor = txn->createDataCursor();
+      auto cursor = ptxn.value()->createDataCursor();
       cursor->seek("");
+
 
       while (true) {
         Expected<Record> exptRcd = cursor->next();
@@ -242,6 +269,10 @@ class DbsizeCommand : public Command {
         if (chunkId >= server->getSegmentMgr()->getChunkSize()) {
           break;
         }
+        // NOTE(wayenchen) ignore slot not belong to me
+        if (enableCluster && !checkSlots.test(chunkId)) {
+          continue;
+        }
 
         auto dbid = exptRcd.value().getRecordKey().getDbId();
         if (dbid != currentDbid) {
@@ -252,7 +283,7 @@ class DbsizeCommand : public Command {
         }
         auto ttl = exptRcd.value().getRecordValue().getTtl();
         if (!containExpire &&
-            (!Command::noExpire() && ttl != 0 &&
+            (!server->getParams()->noexpire && ttl != 0 &&
              ttl < ts)) {  // skip the expired key
           continue;
         }
@@ -317,9 +348,8 @@ class DbEmptyCommand : public Command {
   }
 
   Expected<std::string> run(Session* sess) final {
-    auto server = sess->getServerEntry();
-    int64_t containData = server->containData() ? 0 : 1;
-    return Command::fmtLongLong(containData);
+    int64_t b = sess->getServerEntry()->isDbEmpty() ? 1 : 0;
+    return Command::fmtLongLong(b);
   }
 } dbEmptyCmd;
 
@@ -427,12 +457,12 @@ class IterAllKeysCommand : public Command {
       return expdb.status();
     }
     PStore kvstore = expdb.value().store;
-    auto ptxn = kvstore->createTransaction(sess);
+    auto ptxn = sess->getCtx()->createTransaction(kvstore);
     if (!ptxn.ok()) {
       return ptxn.status();
     }
-    std::unique_ptr<Transaction> txn = std::move(ptxn.value());
-    auto cursor = txn->createDataCursor();
+
+    auto cursor = ptxn.value()->createDataCursor();
     if (args[2] == "0") {
       cursor->seek("");
     } else {
@@ -441,6 +471,14 @@ class IterAllKeysCommand : public Command {
         return unhex.status();
       }
       cursor->seek(unhex.value());
+    }
+
+    std::bitset<CLUSTER_SLOTS> checkSlots;
+    bool enableCluster = server->getParams()->clusterEnabled;
+    if (enableCluster) {
+      auto myself = server->getClusterMgr()->getClusterState()->getMyselfNode();
+      checkSlots = myself->nodeIsMaster() ? myself->getSlots()
+                                          : myself->getMaster()->getSlots();
     }
 
     std::unordered_map<std::string, uint64_t> lIdx;
@@ -464,6 +502,11 @@ class IterAllKeysCommand : public Command {
       // always at the last of rocksdb, and the chunkid is very big
       if (chunkId >= server->getSegmentMgr()->getChunkSize()) {
         break;
+      }
+
+      // NOTE(wayenchen) ignore slot not belong to me
+      if (enableCluster && !checkSlots.test(chunkId)) {
+        continue;
       }
 
       auto valueType = exptRcd.value().getRecordValue().getRecordType();
@@ -554,12 +597,11 @@ class IterAllCommand : public Command {
       return expdb.status();
     }
     PStore kvstore = expdb.value().store;
-    auto ptxn = kvstore->createTransaction(sess);
+    auto ptxn = sess->getCtx()->createTransaction(kvstore);
     if (!ptxn.ok()) {
       return ptxn.status();
     }
-    std::unique_ptr<Transaction> txn = std::move(ptxn.value());
-    auto cursor = txn->createDataCursor();
+    auto cursor = ptxn.value()->createDataCursor();
     if (args[2] == "0") {
       cursor->seek("");
     } else {
@@ -606,7 +648,7 @@ class IterAllCommand : public Command {
       if (valueType != RecordType::RT_KV) {
         auto key = exptRcd.value().getRecordKey().getPrimaryKey();
         RecordKey mk(chunkId, dbid, RecordType::RT_DATA_META, key, "");
-        Expected<RecordValue> eValue = kvstore->getKV(mk, txn.get());
+        Expected<RecordValue> eValue = kvstore->getKV(mk, ptxn.value());
         if (eValue.ok()) {
           targetTtl = eValue.value().getTtl();
         } else {
@@ -667,7 +709,7 @@ class IterAllCommand : public Command {
                               RecordType::RT_DATA_META,
                               o.getRecordKey().getPrimaryKey(),
                               "");
-            auto expRv = kvstore->getKV(metakey, txn.get());
+            auto expRv = kvstore->getKV(metakey, ptxn.value());
             if (!expRv.ok()) {
               return expRv.status();
             }
@@ -711,7 +753,7 @@ class IterAllCommand : public Command {
 
 class ShowCommand : public Command {
  public:
-  ShowCommand() : Command("show", "a") {}
+  ShowCommand() : Command("show", "as") {}
 
   ssize_t arity() const {
     return -1;
@@ -839,7 +881,7 @@ class ShowCommand : public Command {
 
 class ToggleFtmcCommand : public Command {
  public:
-  ToggleFtmcCommand() : Command("toggleftmc", "a") {}
+  ToggleFtmcCommand() : Command("toggleftmc", "as") {}
 
   ssize_t arity() const {
     return 2;
@@ -876,7 +918,7 @@ class ToggleFtmcCommand : public Command {
 
 class RocksPropertyCommand : public Command {
  public:
-  RocksPropertyCommand() : Command("rocksproperty", "a") {}
+  RocksPropertyCommand() : Command("rocksproperty", "as") {}
 
   ssize_t arity() const {
     return -2;
@@ -1044,8 +1086,7 @@ class CommandCommand : public Command {
       auto arg2 = toLower(args[2]);
       auto iter = cmdmap.find(arg2);
       if (iter == cmdmap.end()) {
-        return {ErrorCodes::ERR_PARSEOPT,
-                "Invalid command specified: " + arg2};
+        return {ErrorCodes::ERR_PARSEOPT, "Invalid command specified: " + arg2};
       }
 
       auto cmd = iter->second;
@@ -1080,7 +1121,7 @@ class CommandCommand : public Command {
 
 class CommandListCommand : public Command {
  public:
-  CommandListCommand() : Command("commandlist", "a") {}
+  CommandListCommand() : Command("commandlist", "as") {}
 
   ssize_t arity() const {
     return -1;
@@ -1236,7 +1277,7 @@ class CommandListCommand : public Command {
 
 class BinlogTimeCommand : public Command {
  public:
-  BinlogTimeCommand() : Command("binlogtime", "a") {}
+  BinlogTimeCommand() : Command("binlogtime", "as") {}
 
   ssize_t arity() const {
     return 3;
@@ -1277,12 +1318,11 @@ class BinlogTimeCommand : public Command {
       return expdb.status();
     }
     PStore kvstore = expdb.value().store;
-    auto ptxn = kvstore->createTransaction(sess);
+    auto ptxn = sess->getCtx()->createTransaction(kvstore);
     if (!ptxn.ok()) {
       return ptxn.status();
     }
-    std::unique_ptr<Transaction> txn = std::move(ptxn.value());
-    auto cursor = txn->createRepllogCursorV2(binlogId.value(), true);
+    auto cursor = ptxn.value()->createRepllogCursorV2(binlogId.value(), true);
     auto explog = cursor->nextV2();
     if (!explog.ok()) {
       return explog.status();
@@ -1293,7 +1333,7 @@ class BinlogTimeCommand : public Command {
 
 class BinlogPosCommand : public Command {
  public:
-  BinlogPosCommand() : Command("binlogpos", "a") {}
+  BinlogPosCommand() : Command("binlogpos", "as") {}
 
   ssize_t arity() const {
     return 2;
@@ -1335,10 +1375,10 @@ class BinlogPosCommand : public Command {
 
 class BinlogStartCommand : public Command {
  public:
-  BinlogStartCommand() : Command("binlogstart", "a") {}
+  BinlogStartCommand() : Command("binlogstart", "as") {}
 
   ssize_t arity() const {
-    return 2;
+    return -2;
   }
 
   int32_t firstkey() const {
@@ -1371,26 +1411,93 @@ class BinlogStartCommand : public Command {
       return expdb.status();
     }
     PStore kvstore = expdb.value().store;
-    auto ptxn = kvstore->createTransaction(sess);
+    auto ptxn = sess->getCtx()->createTransaction(kvstore);
     if (!ptxn.ok()) {
       return ptxn.status();
     }
-    std::unique_ptr<Transaction> txn = std::move(ptxn.value());
-    auto expBinlogid = RepllogCursorV2::getMinBinlogId(txn.get());
-    if (expBinlogid.status().code() == ErrorCodes::ERR_EXHAUST) {
-      return Command::fmtZero();
+    // only get from cursor, beside the min binlog meta
+    if (args.size() >=3 && toLower(args[2]) == "fromcursor") {
+      auto expBinlogid = RepllogCursorV2::getMinBinlogByCursor(ptxn.value());
+      if (expBinlogid.status().code() == ErrorCodes::ERR_EXHAUST) {
+        return Command::fmtZero();
+      }
+      if (!expBinlogid.ok()) {
+        return expBinlogid.status();
+      }
+      return Command::fmtLongLong(expBinlogid.value().id);
+    } else {
+      auto expBinlogid = RepllogCursorV2::getMinBinlogId(ptxn.value());
+      if (expBinlogid.status().code() == ErrorCodes::ERR_EXHAUST) {
+        return Command::fmtZero();
+      }
+      if (!expBinlogid.ok()) {
+        return expBinlogid.status();
+      }
+      return Command::fmtLongLong(expBinlogid.value());
+    }
+  }
+} binlogStartCommand;
+
+class BinlogMetaCommand : public Command {
+ public:
+  BinlogMetaCommand() : Command("binlogmeta", "as") {}
+
+  ssize_t arity() const {
+    return 2;
+  }
+
+  int32_t firstkey() const {
+    return 1;
+  }
+
+  int32_t lastkey() const {
+    return 1;
+  }
+
+  int32_t keystep() const {
+    return 1;
+  }
+
+  Expected<std::string> run(Session* sess) final {
+    const std::vector<std::string>& args = sess->getArgs();
+    Expected<uint64_t> storeId = ::tendisplus::stoul(args[1]);
+    if (!storeId.ok()) {
+      return storeId.status();
+    }
+
+    auto server = sess->getServerEntry();
+    if (storeId.value() >= server->getKVStoreCount()) {
+      return {ErrorCodes::ERR_PARSEOPT, "invalid instance num"};
+    }
+
+    auto expdb = server->getSegmentMgr()->getDb(
+            sess, storeId.value(), mgl::LockMode::LOCK_IS, false, 0);
+    if (!expdb.ok()) {
+      return expdb.status();
+    }
+    PStore kvstore = expdb.value().store;
+    auto ptxn = sess->getCtx()->createTransaction(kvstore);
+    if (!ptxn.ok()) {
+      return ptxn.status();
+    }
+    // only get the min binlog meta
+    auto expBinlogid = RepllogCursorV2::getMinBinlogMeta(ptxn.value(), false);
+    if (expBinlogid.status().code() == ErrorCodes::ERR_NOTFOUND) {
+      return Command::fmtBulk("dont has min binlog meta");
     }
     if (!expBinlogid.ok()) {
       return expBinlogid.status();
     }
-
-    return Command::fmtLongLong(expBinlogid.value());
+    std::stringstream ss;
+    ss << "minbinlogid:" << expBinlogid.value().id
+      << " ts:" << expBinlogid.value().ts;
+    return Command::fmtBulk(ss.str());
   }
-} binlogStartCommand;
+} binlogmetaCommand;
 
 class BinlogFlushCommand : public Command {
  public:
-  BinlogFlushCommand() : Command("binlogflush", "a") {}
+  BinlogFlushCommand() : Command("binlogflush", "as") {}
 
   ssize_t arity() const {
     return 2;
@@ -1443,7 +1550,7 @@ class BinlogFlushCommand : public Command {
 
 class DebugCommand : public Command {
  public:
-  DebugCommand() : Command("debug", "a") {}
+  DebugCommand() : Command("debug", "as") {}
 
   ssize_t arity() const {
     return -1;
@@ -1467,7 +1574,7 @@ class DebugCommand : public Command {
 
 class tendisstatCommand : public Command {
  public:
-  tendisstatCommand() : Command("tendisstat", "a") {}
+  tendisstatCommand() : Command("tendisstat", "as") {}
 
   ssize_t arity() const {
     return -1;
@@ -1576,7 +1683,7 @@ class tendisstatCommand : public Command {
 
 class ShutdownCommand : public Command {
  public:
-  ShutdownCommand() : Command("shutdown", "a") {}
+  ShutdownCommand() : Command("shutdown", "as") {}
 
   ssize_t arity() const {
     return -1;
@@ -1806,10 +1913,12 @@ class InfoCommand : public Command {
     infoBinlogInfo(allsections, defsections, section, sess, result);
     infoCPU(allsections, defsections, section, sess, result);
     infoCommandStats(allsections, defsections, section, sess, result);
+    infoCluster(allsections, defsections, section, sess, result);
     infoKeyspace(allsections, defsections, section, sess, result);
     infoBackup(allsections, defsections, section, sess, result);
     infoDataset(allsections, defsections, section, sess, result);
     infoCompaction(allsections, defsections, section, sess, result);
+    infoIndexManager(allsections, defsections, section, sess, result);
     infoLevelStats(allsections, defsections, section, sess, result);
     infoRocksdbStats(allsections, defsections, section, sess, result);
     infoRocksdbPerfStats(allsections, defsections, section, sess, result);
@@ -1827,6 +1936,8 @@ class InfoCommand : public Command {
       auto server = sess->getServerEntry();
       uint64_t uptime = nsSinceEpoch() - server->getStartupTimeNs();
 
+      auto mode =
+        server->getParams()->clusterEnabled ? "cluster" : "standalone";
       std::stringstream ss;
       static int call_uname = 1;
 #ifndef _WIN32
@@ -1841,9 +1952,14 @@ class InfoCommand : public Command {
          << "redis_git_sha1:" << TENDISPLUS_GIT_SHA1 << "\r\n"
          << "redis_git_dirty:" << TENDISPLUS_GIT_DIRTY << "\r\n"
          << "redis_build_id:" << redisBuildId() << "\r\n"
-         << "redis_mode:"
-         << "standalone"
+         << "redis_mode:" << mode << "\r\n"
+#ifdef TENDIS_DEBUG
+         << "TENDIS_DEBUG:ON"
          << "\r\n"
+#else
+         << "TENDIS_DEBUG:OFF"
+         << "\r\n"
+#endif
 #ifndef _WIN32
          << "os:" << name.sysname << " " << name.release << " " << name.machine
          << "\r\n"  // NOLINT
@@ -1887,29 +2003,6 @@ class InfoCommand : public Command {
     }
   }
 
-  static int64_t getIntSize(const string& str) {
-    if (str.size() <= 2) {
-      LOG(ERROR) << "getIntSize failed:" << str;
-      return -1;
-    }
-    string value = str.substr(0, str.size() - 2);
-    string unit = str.substr(str.size() - 2, 2);
-    Expected<int64_t> size = ::tendisplus::stoll(value);
-    if (!size.ok()) {
-      LOG(ERROR) << "getIntSize failed:" << str;
-      return -1;
-    }
-    if (unit == "kB") {
-      return size.value() * 1024;
-    } else if (unit == "mB") {
-      return size.value() * 1024 * 1024;
-    } else if (unit == "gB") {
-      return size.value() * 1024 * 1024 * 1024;
-    }
-    LOG(ERROR) << "getIntSize failed:" << str;
-    return -1;
-  }
-
   static void infoMemory(bool allsections,
                          bool defsections,
                          const std::string& section,
@@ -1939,14 +2032,24 @@ class InfoCommand : public Command {
           if (v[0] == "VmSize") {  // virtual memory
             used_memory_vir_human = trim(v[1]);
             strDelete(used_memory_vir_human, ' ');
-            vir_human_size = getIntSize(used_memory_vir_human);
+            auto s = getIntSize(used_memory_vir_human);
+            if (s.ok()) {
+              vir_human_size = s.value();
+            } else {
+              LOG(ERROR) << "getIntSize failed:" << s.status().toString();
+            }
           } else if (v[0] == "VmPeak") {  // peak of virtual memory
             used_memory_vir_peak_human = trim(v[1]);
             strDelete(used_memory_vir_peak_human, ' ');
           } else if (v[0] == "VmRSS") {  // physic memory
             used_memory_rss_human = trim(v[1]);
             strDelete(used_memory_rss_human, ' ');
-            rss_human_size = getIntSize(used_memory_rss_human);
+            auto s = getIntSize(used_memory_rss_human);
+            if (s.ok()) {
+              rss_human_size = s.value();
+            } else {
+              LOG(ERROR) << "getIntSize failed:" << s.status().toString();
+            }
           } else if (v[0] == "VmHWM") {  // peak of physic memory
             used_memory_rss_peak_human = trim(v[1]);
             strDelete(used_memory_rss_peak_human, ' ');
@@ -2041,6 +2144,20 @@ class InfoCommand : public Command {
       replMgr->getReplInfo(ss);
       ss << "\r\n";
       result << ss.str();
+    }
+  }
+
+  static void infoCluster(bool allsections,
+                          bool defsections,
+                          const std::string& section,
+                          Session* sess,
+                          std::stringstream& result) {
+    if (allsections || defsections || section == "cluster") {
+      auto server = sess->getServerEntry();
+      auto clusterEnabled = server->isClusterEnabled() ? 1 : 0;
+      result << "# Cluster\r\n";
+      result << "cluster_enabled:" << clusterEnabled << "\r\n"
+             << "\r\n";
     }
   }
 
@@ -2166,8 +2283,12 @@ class InfoCommand : public Command {
     if (allsections || defsections || section == "dataset") {
       auto server = sess->getServerEntry();
       std::stringstream ss;
-      uint64_t total = 0, live = 0, estimate = 0;
+      uint64_t total = 0, size_binlogcf = 0, live = 0, estimate = 0;
       server->getTotalIntProperty(sess, "rocksdb.total-sst-files-size", &total);
+      server->getTotalIntProperty(sess,
+                                  "rocksdb.total-sst-files-size",
+                                  &size_binlogcf,
+                                  ColumnFamilyNumber::ColumnFamily_Binlog);
       server->getTotalIntProperty(sess, "rocksdb.live-sst-files-size", &live);
       server->getTotalIntProperty(
         sess, "rocksdb.estimate-live-data-size", &estimate);
@@ -2186,26 +2307,38 @@ class InfoCommand : public Command {
       server->getTotalIntProperty(
         sess, "rocksdb.estimate-pending-compaction-bytes", &compaction_pending);
 
+      auto iter_skip =
+        server->getStatCountByName(sess, "rocksdb.number.iter.skip");
+      auto filter_count =
+        server->getStatCountByName(sess, "rocksdb.compaction-filter-count");
+      auto expire_count =
+        server->getStatCountByName(sess, "rocksdb.compaction-kv-expired-count");
+
+      uint64_t blockUsage = server->getBlockCache()->GetUsage();
+      uint64_t blockPinnedUsage = server->getBlockCache()->GetPinnedUsage();
+      uint64_t blockCapacity = server->getBlockCache()->GetCapacity();
 
       ss << "# Dataset\r\n";
       ss << "rocksdb.kvstore-count:" << server->getKVStoreCount() << "\r\n";
       ss << "rocksdb.total-sst-files-size:" << total << "\r\n";
+      ss << "rocksdb.binlogcf-sst-files-size:" << size_binlogcf << "\r\n";
       ss << "rocksdb.live-sst-files-size:" << live << "\r\n";
       ss << "rocksdb.estimate-live-data-size:" << estimate << "\r\n";
       ss << "rocksdb.estimate-num-keys:" << numkeys << "\r\n";
-      ss << "rocksdb.total-memory:"
-         << memtables + tablereaderMem +
-          (uint64_t)server->getParams()->rocksBlockcacheMB * 1024 * 1024
+      ss << "rocksdb.total-memory:" << memtables + tablereaderMem + blockUsage
          << "\r\n";
       ss << "rocksdb.cur-size-all-mem-tables:" << memtables << "\r\n";
       ss << "rocksdb.estimate-table-readers-mem:" << tablereaderMem << "\r\n";
-      ss << "rocksdb.blockcache:"
-         << (uint64_t)server->getParams()->rocksBlockcacheMB * 1024 * 1024
-         << "\r\n";
+      ss << "rocksdb.blockcache.capacity:" << blockCapacity << "\r\n";
+      ss << "rocksdb.blockcache.usage:" << blockUsage << "\r\n";
+      ss << "rocksdb.blockcache.pinnedusage:" << blockPinnedUsage << "\r\n";
       ss << "rocksdb.mem-table-flush-pending:" << mem_pending << "\r\n";
       ss << "rocksdb.estimate-pending-compaction-bytes:" << compaction_pending
          << "\r\n";
       ss << "rocksdb.compaction-pending:" << numCompaction << "\r\n";
+      ss << "rocksdb.number.iter.skip:" << iter_skip << "\r\n";
+      ss << "rocksdb.compaction-filter-count:" << filter_count << "\r\n";
+      ss << "rocksdb.compaction-kv-expired-count:" << expire_count << "\r\n";
       ss << "\r\n";
       result << ss.str();
     }
@@ -2255,6 +2388,33 @@ class InfoCommand : public Command {
           continue;
         }
         std::string prefix = "rocksdb" + store->dbId() + ".";
+        replaceAll(tmp, "rocksdb.", prefix);
+
+        result << tmp;
+      }
+
+      result << "\r\n";
+    }
+
+    if (section == "levelstats") {
+      auto server = sess->getServerEntry();
+      for (uint64_t i = 0; i < server->getKVStoreCount(); ++i) {
+        auto expdb = server->getSegmentMgr()->getDb(
+          sess, i, mgl::LockMode::LOCK_IS, false, 0);
+        if (!expdb.ok()) {
+          continue;
+        }
+
+        auto store = expdb.value().store;
+        std::string tmp;
+        if (!store->getProperty("rocksdb.levelstatsex",
+                                &tmp,
+                                ColumnFamilyNumber::ColumnFamily_Binlog)) {
+          LOG(WARNING) << "store id " << i
+                       << " rocksdb.levelstatsex not supported";
+          continue;
+        }
+        std::string prefix = "rocksdb" + store->dbId() + ".binlog.";
         replaceAll(tmp, "rocksdb.", prefix);
 
         result << tmp;
@@ -2353,40 +2513,11 @@ class InfoCommand : public Command {
                              const std::string& section,
                              Session* sess,
                              std::stringstream& result) {
-    if (section == "binloginfo") {
+    if (allsections || defsections || section == "binloginfo") {
       auto server = sess->getServerEntry();
 
       result << "# BinlogInfo\r\n";
-      for (uint32_t i = 0; i < server->getKVStoreCount(); i++) {
-        auto expdb = server->getSegmentMgr()->getDb(
-          sess, i, mgl::LockMode::LOCK_IS, false, 0);
-        if (!expdb.ok()) {
-          continue;
-        }
-        PStore kvstore = expdb.value().store;
-        auto ptxn = kvstore->createTransaction(sess);
-        if (!ptxn.ok()) {
-          continue;
-        }
-        std::unique_ptr<Transaction> txn = std::move(ptxn.value());
-        auto eMin = RepllogCursorV2::getMinBinlog(txn.get());
-        if (!eMin.ok()) {
-          continue;
-        }
-        auto eMax = RepllogCursorV2::getMaxBinlog(txn.get());
-        if (!eMax.ok()) {
-          continue;
-        }
-        result << "rocksdb" + kvstore->dbId() << ":"
-               << "min=" << eMin.value().getBinlogId()
-               << ",minTs=" << eMin.value().getTimestamp()
-               << ",minRevision=" << (int64_t)eMin.value().getVersionEp()
-               << ",max=" << eMax.value().getBinlogId()
-               << ",maxTs=" << eMax.value().getTimestamp()
-               << ",maxRevision=" << (int64_t)eMax.value().getVersionEp()
-               << ",highestVisble=" << kvstore->getHighestBinlogId() << "\r\n";
-      }
-
+      result << server->getReplManager()->getRecycleBinlogStr(sess);
       result << "\r\n";
     }
   }
@@ -2399,7 +2530,8 @@ class InfoCommand : public Command {
     if (allsections || defsections || section == "rocksdbbgerror") {
       auto server = sess->getServerEntry();
 
-      result << "# RocksdbBgError\r\n";
+      uint64_t bgerrcnt = 0;
+      std::stringstream ss;
       for (uint64_t i = 0; i < server->getKVStoreCount(); ++i) {
         auto expdb = server->getSegmentMgr()->getDb(
           sess, i, mgl::LockMode::LOCK_IS, false, 0);
@@ -2410,8 +2542,28 @@ class InfoCommand : public Command {
         auto store = expdb.value().store;
         auto ret = store->getBgError();
         if (ret != "") {
-          result << "rocksdb" << store->dbId() << ":" << ret << "\n";
+          ss << "rocksdb" << store->dbId() << ":" << ret << "\r\n";
+          bgerrcnt++;
         }
+      }
+      result << "# RocksdbBgError\r\n";
+      result << "rocksdb_bg_error_count:" << bgerrcnt << "\r\n";
+      result << ss.str();
+      result << "\r\n";
+    }
+  }
+
+  static void infoIndexManager(bool allsections,
+                               bool defsections,
+                               const std::string& section,
+                               Session* sess,
+                               std::stringstream& result) {
+    if (allsections || section == "indexmanager") {
+      auto server = sess->getServerEntry();
+
+      result << "# IndexManager\r\n";
+      if (server->getIndexMgr()) {
+        result << server->getIndexMgr()->getInfoString();
       }
       result << "\r\n";
     }
@@ -2510,7 +2662,7 @@ class ObjectCommand : public Command {
 
 class ConfigCommand : public Command {
  public:
-  ConfigCommand() : Command("config", "lat") {}
+  ConfigCommand() : Command("config", "lats") {}
 
   ssize_t arity() const {
     return -2;
@@ -2568,12 +2720,9 @@ class ConfigCommand : public Command {
       } else if (configName == "appendonly") {
         // NOTE(takenliu): donothing, for tests/*.tcl
       } else {
-        string errinfo;
-        bool force = false;
-        if (!sess->getServerEntry()->getParams()->setVar(
-              configName, args[3], &errinfo, force)) {
-          return {ErrorCodes::ERR_PARSEOPT, errinfo};
-        }
+        auto s = sess->getServerEntry()->getParams()->setVar(
+          configName, args[3], false);
+        RET_IF_ERR(s);
       }
     } else if (operation == "get") {
       if (args.size() != 3) {
@@ -2659,12 +2808,15 @@ class ConfigCommand : public Command {
       if (!s.ok()) {
         return s;
       }
+    } else {
+      LOG(INFO) << "unknown sub command:" << operation;
+      return {ErrorCodes::ERR_PARSEOPT, "unknown sub command:" + operation};
     }
     return Command::fmtOK();
   }
 } configCmd;
 
-#define EMPTYDB_NO_FLAGS 0 /* No flags. */
+#define EMPTYDB_NO_FLAGS 0     /* No flags. */
 #define EMPTYDB_ASYNC (1 << 0) /* Reclaim memory in another thread. */
 
 class FlushGeneric : public Command {
@@ -2721,9 +2873,10 @@ class FlushGeneric : public Command {
   }
 };
 
+// NOTE(takenliu): forbidden call flush command in lua.
 class FlushAllCommand : public FlushGeneric {
  public:
-  FlushAllCommand() : FlushGeneric("flushall", "w") {}
+  FlushAllCommand() : FlushGeneric("flushall", "ws") {}
 
   ssize_t arity() const {
     return -1;
@@ -2756,9 +2909,10 @@ class FlushAllCommand : public FlushGeneric {
   }
 } flushallCmd;
 
+// NOTE(takenliu): forbidden call flush command in lua.
 class FlushdbCommand : public FlushGeneric {
  public:
-  FlushdbCommand() : FlushGeneric("flushdb", "w") {}
+  FlushdbCommand() : FlushGeneric("flushdb", "ws") {}
 
   ssize_t arity() const {
     return -1;
@@ -2796,9 +2950,10 @@ class FlushdbCommand : public FlushGeneric {
   }
 } flushdbCmd;
 
+// NOTE(takenliu): forbidden call flush command in lua.
 class FlushAllDiskCommand : public FlushGeneric {
  public:
-  FlushAllDiskCommand() : FlushGeneric("flushalldisk", "w") {}
+  FlushAllDiskCommand() : FlushGeneric("flushalldisk", "ws") {}
 
   ssize_t arity() const {
     return 1;
@@ -2867,7 +3022,7 @@ class MonitorCommand : public Command {
 // if force, no check
 class DestroyStoreCommand : public Command {
  public:
-  DestroyStoreCommand() : Command("destroystore", "a") {}
+  DestroyStoreCommand() : Command("destroystore", "as") {}
 
   ssize_t arity() const {
     return -2;
@@ -2921,7 +3076,7 @@ class DestroyStoreCommand : public Command {
 // It should be safe to pausestore first, and destroystore later
 class PauseStoreCommand : public Command {
  public:
-  PauseStoreCommand() : Command("pausestore", "a") {}
+  PauseStoreCommand() : Command("pausestore", "as") {}
 
   ssize_t arity() const {
     return 2;
@@ -2973,7 +3128,7 @@ class PauseStoreCommand : public Command {
 // resumestore storeId
 class ResumeStoreCommand : public Command {
  public:
-  ResumeStoreCommand() : Command("resumestore", "a") {}
+  ResumeStoreCommand() : Command("resumestore", "as") {}
 
   ssize_t arity() const {
     return 2;
@@ -3026,7 +3181,7 @@ class ResumeStoreCommand : public Command {
 // only used for test. set key to a fixed storeid
 class setInStoreCommand : public Command {
  public:
-  setInStoreCommand() : Command("setinstore", "wm") {}
+  setInStoreCommand() : Command("setinstore", "awms") {}
 
   ssize_t arity() const {
     return -3;
@@ -3063,11 +3218,10 @@ class setInStoreCommand : public Command {
       return {ErrorCodes::ERR_PARSEOPT, "invalid store id"};
     }
     auto kvstore = server->getStores()[storeid];
-    auto ptxn = kvstore->createTransaction(sess);
+    auto ptxn = sess->getCtx()->createTransaction(kvstore);
     if (!ptxn.ok()) {
       return ptxn.status();
     }
-    std::unique_ptr<Transaction> txn = std::move(ptxn.value());
 
     // need get the chunkId, otherwise can't find the key by "GET" command.
     auto expdb = server->getSegmentMgr()->getDbHasLocked(sess, key);
@@ -3082,13 +3236,14 @@ class setInStoreCommand : public Command {
       Record(RecordKey(
                chunkId, sess->getCtx()->getDbId(), RecordType::RT_KV, key, ""),
              RecordValue(value, RecordType::RT_KV, -1)),
-      txn.get());
+      ptxn.value());
     if (!s.ok()) {
       LOG(ERROR) << "setInStoreCommand failed:" << s.toString();
       return s;
     }
 
-    Expected<uint64_t> exptCommitId = txn->commit();
+    Expected<uint64_t> exptCommitId =
+      sess->getCtx()->commitTransaction(ptxn.value());
     if (!exptCommitId.ok()) {
       LOG(ERROR) << "setInStoreCommand failed:"
                  << exptCommitId.status().toString();
@@ -3101,7 +3256,7 @@ class setInStoreCommand : public Command {
 
 class SyncVersionCommand : public Command {
  public:
-  SyncVersionCommand() : Command("syncversion", "a") {}
+  SyncVersionCommand() : Command("syncversion", "as") {}
 
   ssize_t arity() const {
     return 5;
@@ -3133,20 +3288,52 @@ class SyncVersionCommand : public Command {
 
     const auto& name = args[1];
     const auto server = sess->getServerEntry();
+
+    // get all sync version from kvstores
+    // used as syncversion * ? ? v1
+    if (name == "*" && args[2] == "?" && args[3] == "?") {
+      std::stringstream ss;
+      Command::fmtMultiBulkLen(ss, server->getKVStoreCount());
+
+      for (uint32_t i = 0; i < server->getKVStoreCount(); ++i) {
+        auto expdb =
+          server->getSegmentMgr()->getDb(sess, i, mgl::LockMode::LOCK_IS);
+        RET_IF_ERR(expdb.status());
+
+        auto store = expdb.value().store;
+        auto pTxn = sess->getCtx()->createTransaction(store);
+        RET_IF_ERR(pTxn.status());
+
+        auto expMeta = store->getAllVersionMeta(pTxn.value());
+        RET_IF_ERR(expMeta.status());
+        auto meta = expMeta.value();
+
+        if (meta.empty()) {
+          Command::fmtNull(ss);
+          continue;
+        }
+        Command::fmtMultiBulkLen(ss, meta.size());
+        for (const auto& v : meta) {
+          Command::fmtMultiBulkLen(ss, 3);
+          Command::fmtBulk(ss, v.getName());
+          Command::fmtLongLong(ss, static_cast<int64_t>(v.getTimeStamp()));
+          Command::fmtLongLong(ss, static_cast<int64_t>(v.getVersion()));
+        }
+      }
+
+      return ss.str();
+    }
+
     // get ts && version from kvstores
     if (args[2] == "?" && args[3] == "?") {
       VersionMeta minMeta(UINT64_MAX - 1, UINT64_MAX - 1, name);
       for (uint32_t i = 0; i < server->getKVStoreCount(); i++) {
         auto expdb =
           server->getSegmentMgr()->getDb(sess, i, mgl::LockMode::LOCK_IS);
-        if (!expdb.ok()) {
-          return expdb.status();
-        }
+        RET_IF_ERR(expdb.status());
         PStore store = expdb.value().store;
         auto meta = store->getVersionMeta(name);
-        if (!meta.ok()) {
-          return meta.status();
-        }
+        RET_IF_ERR(meta.status());
         auto metaV = meta.value();
         minMeta = std::min(metaV, minMeta);
       }
@@ -3158,19 +3345,13 @@ class SyncVersionCommand : public Command {
     }
 
     auto eTs = tendisplus::stoull(args[2]);
-    if (!eTs.ok()) {
-      return eTs.status();
-    }
+    RET_IF_ERR(eTs.status());
     auto eVersion = tendisplus::stoull(args[3]);
-    if (!eVersion.ok()) {
-      return eVersion.status();
-    }
+    RET_IF_ERR(eVersion.status());
     for (uint32_t i = 0; i < server->getKVStoreCount(); i++) {
       auto expdb =
         server->getSegmentMgr()->getDb(sess, i, mgl::LockMode::LOCK_IS);
-      if (!expdb.ok()) {
-        return expdb.status();
-      }
+      RET_IF_ERR(expdb.status());
       PStore store = expdb.value().store;
       auto s = store->setVersionMeta(name, eTs.value(), eVersion.value());
       if (!s.ok()) {
@@ -3183,7 +3364,7 @@ class SyncVersionCommand : public Command {
 
 class StoreCommand : public Command {
  public:
-  StoreCommand() : Command("store", "a") {}
+  StoreCommand() : Command("store", "as") {}
 
   ssize_t arity() const {
     return -2;
@@ -3208,7 +3389,7 @@ class StoreCommand : public Command {
 
 class EvictCommand : public Command {
  public:
-  EvictCommand() : Command("evict", "w") {}
+  EvictCommand() : Command("evict", "ws") {}
 
   ssize_t arity() const {
     return 2;
@@ -3474,6 +3655,96 @@ class reshapeCommand : public Command {
     return Command::fmtOK();
   }
 } reshapeCmd;
+
+// compactrange [data|default|binlog] start end <kvstoreid>
+class compactRangeCommand : public Command {
+ public:
+  compactRangeCommand() : Command("compactrange", "sM") {}
+
+  ssize_t arity() const {
+    return -4;
+  }
+
+  int32_t firstkey() const {
+    return 0;
+  }
+
+  int32_t lastkey() const {
+    return 0;
+  }
+
+  int32_t keystep() const {
+    return 0;
+  }
+
+  Expected<std::string> run(Session* sess) final {
+    const auto server = sess->getServerEntry();
+    const auto& args = sess->getArgs();
+
+    ColumnFamilyNumber cf = ColumnFamilyNumber::ColumnFamily_Default;
+    auto cfName = toLower(args[1]);
+    if (cfName == "data" || cfName == "default") {
+      cf = ColumnFamilyNumber::ColumnFamily_Default;
+    } else if (cfName == "binlog") {
+      cf = ColumnFamilyNumber::ColumnFamily_Binlog;
+    } else {
+      return {ErrorCodes::ERR_PARSEOPT,
+              "invalid column family" + cfName +
+                ",it must be data|default|binlog"};
+    }
+
+    auto estart = tendisplus::stoull(args[2]);
+    RET_IF_ERR_EXPECTED(estart);
+    uint64_t start = estart.value();
+
+    auto eend = tendisplus::stoull(args[3]);
+    RET_IF_ERR_EXPECTED(eend);
+    uint64_t end = eend.value();
+
+    if (end <= start) {
+      return {ErrorCodes::ERR_PARSEOPT,
+              args[3] + " must be bigger than " + args[2]};
+    }
+
+    std::string str_start, str_end;
+    if (cf == ColumnFamilyNumber::ColumnFamily_Default) {
+      RecordKey tmplRk(start, 0, RecordType::RT_DATA_META, "", "");
+      str_start = tmplRk.prefixChunkid();
+
+      RecordKey tmplRk2(end, 0, RecordType::RT_DATA_META, "", "");
+      str_end = tmplRk2.prefixChunkid();
+    } else {
+      ReplLogKeyV2 tmplRk(start);
+      str_start = tmplRk.encode();
+
+      ReplLogKeyV2 tmplRk2(end);
+      str_end = tmplRk2.encode();
+    }
+
+    uint64_t i = 0;
+    uint64_t store_end = server->getKVStoreCount();
+    if (args.size() > 4) {
+      auto eStoreId = tendisplus::stoull(args[4]);
+      RET_IF_ERR_EXPECTED(eStoreId);
+
+      i = eStoreId.value();
+      store_end = i + 1;
+    }
+
+    for (; i < store_end; i++) {
+      auto expdb =
+        server->getSegmentMgr()->getDb(sess, i, mgl::LockMode::LOCK_IS);
+      RET_IF_ERR_EXPECTED(expdb);
+
+      PStore kvstore = expdb.value().store;
+      auto status = kvstore->compactRange(cf, &str_start, &str_end);
+      if (!status.ok()) {
+        return status;
+      }
+    }
+    return Command::fmtOK();
+  }
+} compactRangeCmd;
 
 // for debug
 class deleteSlotsCommand : public Command {
@@ -3809,7 +4080,7 @@ class EmptyMultiBulkCommand : public Command {
 
 class TendisadminCommand : public Command {
  public:
-  TendisadminCommand() : Command("tendisadmin", "lat") {}
+  TendisadminCommand() : Command("tendisadmin", "lats") {}
 
   ssize_t arity() const {
     return -2;
@@ -3887,7 +4158,7 @@ class TendisadminCommand : public Command {
 
 class DExecCommand : public Command {
  public:
-  DExecCommand() : Command("dexec", "lat") {}
+  DExecCommand() : Command("dexec", "lats") {}
 
   ssize_t arity() const {
     return -3;
@@ -4004,5 +4275,380 @@ class readWriteCommand : public Command {
     return Command::fmtOK();
   }
 } readWriteCmd;
+
+class adminSetCommand : public Command {
+ public:
+  adminSetCommand() : Command("adminset", "awms") {}
+
+  ssize_t arity() const final {
+    return 3;
+  }
+
+  int32_t firstkey() const final {
+    return 1;
+  }
+
+  int32_t lastkey() const final {
+    return 1;
+  }
+
+  int32_t keystep() const final {
+    return 1;
+  }
+
+  Expected<std::string> run(Session* sess) final {
+    auto server = sess->getServerEntry();
+    INVARIANT(server != nullptr);
+
+    const auto& args = sess->getArgs();
+
+    auto key = args[1];
+    auto value = args[2];
+
+    // record ADMINSET data into all kv-store
+    for (uint32_t i = 0; i < server->getKVStoreCount(); ++i) {
+      Status status{ErrorCodes::ERR_OK, ""};
+      auto expdb =
+        server->getSegmentMgr()->getDb(sess, i, mgl::LockMode::LOCK_IX);
+      RET_IF_ERR_EXPECTED(expdb);
+
+      auto kvstore = expdb.value().store;
+      auto ptxn = sess->getCtx()->createTransaction(kvstore);
+      RET_IF_ERR_EXPECTED(ptxn);
+
+      auto* pCtx = sess->getCtx();
+      INVARIANT(pCtx != nullptr);
+
+      // NOTE(pecochen): record timestamp at "cas" field. TimeStamp NOT TTL !!!
+      //        In order to avoid compaction-filter expire record by "ttl" field
+      //        what's more? record as millisecond is enough
+      RecordKey rk(
+        ADMINCMD_CHUNKID, ADMINCMD_DBID, RecordType::RT_DATA_META, key, "");
+      RecordValue rv(
+        value, RecordType::RT_KV, pCtx->getVersionEP(), 0, msSinceEpoch());
+
+      status = kvstore->setKV(rk, rv, ptxn.value());
+      RET_IF_ERR(status);
+
+      auto expCommit = sess->getCtx()->commitTransaction(ptxn.value());
+      RET_IF_ERR_EXPECTED(expCommit);
+    }
+
+    return Command::fmtOK();
+  }
+} adminSetCmd;
+
+class adminGetCommand : public Command {
+ public:
+  adminGetCommand() : Command("adminget", "arFs") {}
+
+  ssize_t arity() const final {
+    return -2;
+  }
+
+  int32_t firstkey() const final {
+    return 1;
+  }
+
+  int32_t lastkey() const final {
+    return 1;
+  }
+
+  int32_t keystep() const final {
+    return 0;
+  }
+
+  /**
+   * @brief format null result,as follow:
+   *        - dbid
+   *        - nil
+   * @param dbid
+   * @return format string
+   */
+  static std::string fmtAdminNull(uint32_t dbid) {
+    std::stringstream ss;
+
+    Command::fmtMultiBulkLen(ss, 2);
+    Command::fmtBulk(ss, std::to_string(dbid));
+    Command::fmtNull(ss);
+
+    return ss.str();
+  }
+
+  /**
+   * @brief format single data result, as follow:
+   *        - dbid
+   *        - value
+   *        - [timestamp]
+   * @param rv  record-value
+   * @param dbid
+   * @param ttl flag shows whether need get timestamp
+   * @return format string
+   */
+  static std::string fmtAdminData(const RecordValue& rv,
+                                  uint32_t dbid,
+                                  bool ttl = false) {
+    std::stringstream ss;
+    const auto& val = rv.getValue();
+    auto ts = rv.getCas();
+
+    if (ttl) {
+      Command::fmtMultiBulkLen(ss, 3);
+      Command::fmtBulk(ss, std::to_string(dbid));
+      Command::fmtBulk(ss, val);
+      Command::fmtLongLong(ss, ts);
+    } else {
+      Command::fmtMultiBulkLen(ss, 2);
+      Command::fmtBulk(ss, std::to_string(dbid));
+      Command::fmtBulk(ss, val);
+    }
+
+    return ss.str();
+  }
+
+  /**
+   * @brief get admin data from specific kv-store
+   * @param key key needs get
+   * @param ttl flag
+   * @param dbid
+   * @param kvstore
+   * @param txn transaction
+   * @return format string or status
+   */
+  static Expected<std::string> getAdminDataFromKvstore(
+    const std::string& key,
+    bool ttl,
+    uint32_t dbid,
+    std::shared_ptr<KVStore> kvstore,
+    Transaction* txn) {
+    RecordKey rk(
+      ADMINCMD_CHUNKID, ADMINCMD_DBID, RecordType::RT_DATA_META, key, "");
+    std::stringstream ss;
+
+    auto expRv = kvstore->getKV(rk, txn);
+    if (!expRv.ok()) {
+      if (expRv.status().code() == ErrorCodes::ERR_NOTFOUND) {
+        ss << fmtAdminNull(dbid);
+      } else {
+        RET_IF_ERR_EXPECTED(expRv);
+      }
+    } else {
+      RecordValue rv = expRv.value();
+      ss << fmtAdminData(rv, dbid, ttl);
+    }
+
+    return ss.str();
+  }
+
+  /**
+   * @brief get admin data from specific db, wrapper for getAdmindataFromKvstore
+   * @param dbid
+   * @param key
+   * @param withTtl
+   * @param sess
+   * @param ss
+   * @return
+   */
+  static Status getAdminDataFromDb(uint32_t dbid,
+                                   const std::string& key,
+                                   bool withTtl,
+                                   Session* sess,
+                                   std::stringstream* ss) {
+    auto expDb = sess->getServerEntry()->getSegmentMgr()->getDb(
+      sess, dbid, mgl::LockMode::LOCK_IS);
+    RET_IF_ERR_EXPECTED(expDb);
+
+    auto kvstore = expDb.value().store;
+    auto pTxn = sess->getCtx()->createTransaction(kvstore);
+    RET_IF_ERR_EXPECTED(pTxn);
+
+    auto expData =
+      getAdminDataFromKvstore(key, withTtl, dbid, kvstore, pTxn.value());
+    RET_IF_ERR_EXPECTED(expData);
+
+    *ss << expData.value();
+    return {ErrorCodes::ERR_OK, ""};
+  }
+
+  Expected<std::string> run(Session* sess) final {
+    auto server = sess->getServerEntry();
+    auto pCtx = sess->getCtx();
+    const auto& args = sess->getArgs();
+
+    INVARIANT(server != nullptr);
+    INVARIANT(pCtx != nullptr);
+
+    int storeId;
+    bool allStore{true};
+    bool withTtl{false};
+    std::string key = args[1];
+    std::stringstream ss;
+
+    // parser options, include "storeid" and "withttl"
+    for (size_t i = 2; i < args.size(); i += 2) {
+      if (toLower(args[i]) == "storeid" && i + 1 < args.size()) {
+        if (args[i + 1] == "*") {
+          allStore = true;
+        } else {
+          auto expStoreId = tendisplus::stoul(args[i + 1]);
+          RET_IF_ERR_EXPECTED(expStoreId);
+          storeId = expStoreId.value();
+          allStore = false;
+
+          if (static_cast<uint32_t>(storeId) >= server->getKVStoreCount()) {
+            return {ErrorCodes::ERR_OUT_OF_RANGE, "storeid out of range"};
+          }
+        }
+      } else if (toLower(args[i]) == "withttl" && i + 1 < args.size()) {
+        static std::map<std::string, bool> matchMap = {
+          {"yes", true},
+          {"1", true},
+          {"on", true},
+          {"no", false},
+          {"0", false},
+          {"off", false},
+        };
+        withTtl = matchMap.count(args[i + 1]) != 0 && matchMap[args[i + 1]];
+      }
+    }
+
+    if (allStore) {
+      Command::fmtMultiBulkLen(ss, server->getKVStoreCount());
+      for (size_t i = 0; i < server->getKVStoreCount(); ++i) {
+        getAdminDataFromDb(i, key, withTtl, sess, &ss);
+      }
+    } else {
+      Command::fmtMultiBulkLen(ss, 1);
+      getAdminDataFromDb(storeId, key, withTtl, sess, &ss);
+    }
+
+    return ss.str();
+  }
+} adminGetCmd;
+
+class adminDelCommand : public Command {
+ public:
+  adminDelCommand() : Command("admindel", "aws") {}
+
+  ssize_t arity() const final {
+    return -2;
+  }
+
+  int32_t firstkey() const final {
+    return 1;
+  }
+
+  int32_t lastkey() const final {
+    return 1;
+  }
+
+  int32_t keystep() const final {
+    return 1;
+  }
+
+  /**
+   * @brief delete specific key in specific db
+   * @param sess Session
+   * @param txn Transaction
+   * @param key
+   * @param kvstore
+   * @return
+   */
+  static Expected<bool> delSpecificKey(Session* sess,
+                                       Transaction* txn,
+                                       const std::string& key,
+                                       std::shared_ptr<KVStore> kvstore) {
+    RecordKey rk(
+      ADMINCMD_CHUNKID, ADMINCMD_DBID, RecordType::RT_DATA_META, key, "");
+
+    // ADMIN data no need to expire, so directly DEL is enough.
+    // avoid increase operation steps, use KVStore::delKV NOT Command::delKey
+    // should check whether KV exists first.
+    auto expRv = kvstore->getKV(rk, txn);
+    if (expRv.status().code() == ErrorCodes::ERR_NOTFOUND) {
+      return false;
+    }
+    RET_IF_ERR_EXPECTED(expRv);
+
+    auto status = kvstore->delKV(rk, txn);
+    if (status.ok()) {
+      return true;
+    }
+    return status;
+  }
+
+  Expected<std::string> run(Session* sess) final {
+    auto server = sess->getServerEntry();
+    auto pCtx = sess->getCtx();
+    const auto& args = sess->getArgs();
+
+    INVARIANT(server != nullptr);
+    INVARIANT(pCtx != nullptr);
+
+    int64_t delCount = 1;
+    for (size_t i = 0; i < sess->getServerEntry()->getKVStoreCount(); ++i) {
+      auto expDb = sess->getServerEntry()->getSegmentMgr()->getDb(
+        sess, i, mgl::LockMode::LOCK_IX);
+      RET_IF_ERR_EXPECTED(expDb);
+
+      auto kvstore = expDb.value().store;
+      auto ptxn = sess->getCtx()->createTransaction(kvstore);
+      RET_IF_ERR_EXPECTED(ptxn);
+
+      auto expDel = delSpecificKey(sess, ptxn.value(), args[1], kvstore);
+      RET_IF_ERR_EXPECTED(expDel);
+
+      auto expCommit = sess->getCtx()->commitTransaction(ptxn.value());
+      RET_IF_ERR_EXPECTED(expCommit);
+
+      delCount = delCount && expDel.value() ? 1 : 0;
+    }
+
+    std::stringstream ss;
+    Command::fmtLongLong(ss, delCount);
+
+    return ss.str();
+  }
+} admindelCmd;
+
+#ifndef WIN32
+class JeprofCommand : public Command {
+ public:
+  JeprofCommand() : Command("jeprof", "as") {}
+
+  ssize_t arity() const {
+    return 2;
+  }
+
+  int32_t firstkey() const {
+    return 0;
+  }
+
+  int32_t lastkey() const {
+    return 0;
+  }
+
+  int32_t keystep() const {
+    return 0;
+  }
+  Expected<std::string> run(Session* sess) final {
+    const std::vector<std::string>& args = sess->getArgs();
+    auto action = toLower(args[1]);
+    if (action == "on") {
+      bool active = true;
+      mallctl("prof.active", NULL, NULL, &active, sizeof(active));
+    } else if (action == "off") {
+      bool active = false;
+      mallctl("prof.active", NULL, NULL, &active, sizeof(active));
+    } else if (action == "dump") {
+      mallctl("prof.dump", NULL, NULL, NULL, 0);
+    } else {
+      return {ErrorCodes::ERR_UNKNOWN,
+              "args wrong, only support: jeprof [on/off/dump]"};
+    }
+    return Command::fmtOK();
+  }
+} jeprofCommand;
+#endif
 
 }  // namespace tendisplus

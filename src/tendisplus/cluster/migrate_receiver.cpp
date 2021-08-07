@@ -51,14 +51,13 @@ Status ChunkMigrateReceiver::receiveSnapshot() {
   std::string value = expRsp.value();
   if (expRsp.value() != "+OK") {
     LOG(WARNING) << "readymigrate req srcDb failed:" << expRsp.value();
-    return {ErrorCodes::ERR_INTERNAL, "readymigrate req srcDb failed"};
+    return {ErrorCodes::ERR_MIGRATE, "readymigrate req srcDb failed"};
   }
 
   setSnapShotStartTime(msSinceEpoch());
   setTaskStartTime(msSinceEpoch());
   setStartTime(timePointRepr(SCLOCK::now()));
   uint32_t timeoutSec = 5;
-  uint32_t readNum = 0;
   while (true) {
     if (!isRunning()) {
       LOG(ERROR) << "stop receiver task on taskid:" << _taskid;
@@ -95,7 +94,7 @@ Status ChunkMigrateReceiver::receiveSnapshot() {
         LOG(ERROR) << "supply set key: " << keyData.value() << "fail";
         return s;
       }
-      readNum++;
+      _snapshotKeyNum.fetch_add(1, std::memory_order_relaxed);
     } else if (exptData.value()[0] == '1') {
       SyncWriteData("+OK")
     } else if (exptData.value()[0] == '2') {
@@ -104,8 +103,9 @@ Status ChunkMigrateReceiver::receiveSnapshot() {
       SyncWriteData("+OK") break;
     }
   }
-  LOG(INFO) << "migrate snapshot transfer done, readnum:" << readNum;
-  _snapshotKeyNum.store(readNum, std::memory_order_relaxed);
+  LOG(INFO) << "migrate snapshot transfer done, readnum:" << getSnapshotNum()
+            << "taskid:" << _taskid;
+
   setSnapShotEndTime(msSinceEpoch());
   return {ErrorCodes::ERR_OK, ""};
 }
@@ -147,7 +147,7 @@ Status ChunkMigrateReceiver::supplySetKV(const string& key,
   // only RT_*_META need recover, it's saved as RT_DATA_META in RecordKey
   // if RecordValue's type is RT_KV need ignore recovering.
   if (expRk.value().getRecordType() == RecordType::RT_DATA_META) {
-    if (!Command::noExpire() && expRv.value().getTtl() > 0 &&
+    if (expRv.value().getTtl() > 0 &&
         expRv.value().getRecordType() != RecordType::RT_KV) {
       // add new index entry
       TTLIndex n_ictx(expRk.value().getPrimaryKey(),

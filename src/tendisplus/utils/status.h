@@ -40,6 +40,7 @@ enum class ErrorCodes {
   ERR_UNKNOWN,
   ERR_CLUSTER,
   ERR_CONNECT_TRY,
+  ERR_MIGRATE,
 
   // error from redis
   ERR_AUTH = 100,
@@ -61,6 +62,7 @@ enum class ErrorCodes {
   ERR_CLUSTER_REDIR_CROSS_SLOT,
   ERR_CLUSTER_REDIR_DOWN_STATE,
   ERR_CLUSTER_REDIR_DOWN_UNBOUND,
+  ERR_LUA,
 };
 
 class Status {
@@ -172,7 +174,7 @@ Expected<T> makeExpected(Args&&... args) {
 #define RET_IF_ERR_EXPECTED(e)                                         \
   do {                                                                 \
     if (!e.ok()) {                                                     \
-      LOG(ERROR) << "Expected failed:" << e.status().toString() << ' ' \
+      LOG(ERROR) << "expected failed:" << e.status().toString() << ' ' \
                  << __FILE__ << ' ' << __LINE__;                       \
       return e.status();                                               \
     }                                                                  \

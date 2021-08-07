@@ -33,6 +33,12 @@ std::string toLower(const std::string& s) {
   return result;
 }
 
+std::string toUpper(const std::string &s) {
+  std::string result(s);
+  std::transform(result.begin(), result.end(), result.begin(), toupper);
+  return result;
+}
+
 Expected<int32_t> stol(const std::string& s) {
   int32_t result;
   try {
@@ -90,7 +96,8 @@ Expected<long double> stold(const std::string& s) {
   try {
     size_t pos = 0;
     result = std::stold(s, &pos);
-    if (s.size() == 0 || isspace(s[0]) || pos != s.size() || isnan(result)) {
+    if (s.size() == 0 || isspace(s[0]) ||
+        pos != s.size() || std::isnan(result)) {
       return {ErrorCodes::ERR_FLOAT, ""};
     }
     return result;
@@ -108,7 +115,7 @@ isspace(((const char*)o->ptr)[0]) ||
 (size_t)(eptr-(char*)o->ptr) != sdslen(o->ptr) ||
 (errno == ERANGE &&
 (value == HUGE_VAL || value == -HUGE_VAL || value == 0)) ||
-isnan(value))
+std::isnan(value))
 return C_ERR;
 
 */
@@ -122,7 +129,8 @@ Expected<double> stod(const std::string& s) {
     char* end;
     result = std::strtod(s.c_str(), &end);
     pos = end - s.c_str();
-    if (s.size() == 0 || isspace(s[0]) || pos != s.size() || isnan(result)) {
+    if (s.size() == 0 || isspace(s[0]) ||
+        pos != s.size() || std::isnan(result)) {
       return {ErrorCodes::ERR_FLOAT, ""};
     }
     return result;
@@ -260,6 +268,46 @@ std::string trim(const std::string& str) {
   return trim_left(trim_right(str));
 }
 
+/* deal with slot range args like  {1..1000} */
+Expected<std::pair<uint32_t, uint32_t>> getSlotRange(const std::string& str) {
+  uint64_t len = str.size();
+  LOG(INFO) << "range len:" << len;
+  if ((str[0] == '{') && (str[len - 1] == '}') && len >= 6) {
+    std::string rangeStr = str.substr(1, str.size() - 2);
+
+    if (rangeStr.find("..") == std::string::npos) {
+      return {ErrorCodes::ERR_CLUSTER, "Invalid range input withot .."};
+    }
+    auto vs = stringSplit(rangeStr, "..");
+
+    if (vs.size() != 2) {
+      return {ErrorCodes::ERR_CLUSTER, "no find start and end position"};
+    }
+
+    auto startSlot = ::tendisplus::stoul(vs[0]);
+    auto endSlot = ::tendisplus::stoul(vs[1]);
+
+    if (!startSlot.ok() || !endSlot.ok()) {
+      return {ErrorCodes::ERR_CLUSTER, "Invalid slot position range"};
+    }
+
+    uint32_t start = startSlot.value();
+    uint32_t end = endSlot.value();
+
+    if (start >= end) {
+      return {ErrorCodes::ERR_CLUSTER,
+              "start position should be less than end"};
+    }
+
+    if (end >= CLUSTER_SLOTS) {
+      return {ErrorCodes::ERR_CLUSTER,
+              "Invalid slot position " + std::to_string(end)};
+    }
+    return std::make_pair(start, end);
+  } else {
+    return {ErrorCodes::ERR_CLUSTER, "Invalid slot range string"};
+  }
+}
 std::string& replaceAll(std::string& str,  // NOLINT
                         const std::string& old_value,
                         const std::string& new_value) {
@@ -368,6 +416,26 @@ std::string getUUid(const int len) {
     ss << (hex.length() < 2 ? '0' + hex : hex);
   }
   return ss.str();
+}
+
+Expected<int64_t> getIntSize(const std::string& str) {
+  if (str.size() <= 2) {
+    return {ErrorCodes::ERR_DECODE, "getIntSize failed:" + str};
+  }
+  std::string value = str.substr(0, str.size() - 2);
+  std::string unit = str.substr(str.size() - 2, 2);
+  Expected<int64_t> size = ::tendisplus::stoll(value);
+  if (!size.ok()) {
+    return size;
+  }
+  if (unit == "kB") {
+    return size.value() * 1024;
+  } else if (unit == "mB") {
+    return size.value() * 1024 * 1024;
+  } else if (unit == "gB") {
+    return size.value() * 1024 * 1024 * 1024;
+  }
+  return {ErrorCodes::ERR_DECODE, "getIntSize failed:" + str};
 }
 
 }  // namespace tendisplus

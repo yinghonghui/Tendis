@@ -8,8 +8,11 @@
 #include <chrono>  // NOLINT
 #include <string>  // NOLINT
 #include <list>
-#include <mutex>   // NOLINT
+#include <mutex>  // NOLINT
 #include "glog/logging.h"
+#ifndef _WIN32
+#include "jemalloc/jemalloc.h"
+#endif
 #include "tendisplus/server/server_entry.h"
 #include "tendisplus/server/server_params.h"
 #include "tendisplus/utils/redis_port.h"
@@ -218,6 +221,7 @@ ServerEntry::ServerEntry()
     _mgLockMgr(nullptr),
     _clusterMgr(nullptr),
     _gcMgr(nullptr),
+    _scriptMgr(nullptr),
     _catalog(nullptr),
     _netMatrix(std::make_shared<NetworkMatrix>()),
     _poolMatrix(std::make_shared<PoolMatrix>()),
@@ -226,9 +230,6 @@ ServerEntry::ServerEntry()
     _enableCluster(false),
     _requirepass(""),
     _masterauth(""),
-    _versionIncrease(true),
-    _generalLog(false),
-    _checkKeyTypeForSet(false),
     _protoMaxBulkLen(CONFIG_DEFAULT_PROTO_MAX_BULK_LEN),
     _dbNum(CONFIG_DEFAULT_DBNUM),
     _scheduleNum(0),
@@ -244,9 +245,6 @@ ServerEntry::ServerEntry(const std::shared_ptr<ServerParams>& cfg)
   : ServerEntry() {
   _requirepass = cfg->requirepass;
   _masterauth = cfg->masterauth;
-  _versionIncrease = cfg->versionIncrease;
-  _generalLog = cfg->generalLog;
-  _checkKeyTypeForSet = cfg->checkKeyTypeForSet;
   _protoMaxBulkLen = cfg->protoMaxBulkLen;
   _enableCluster = cfg->clusterEnabled;
   _dbNum = cfg->dbNum;
@@ -254,6 +252,10 @@ ServerEntry::ServerEntry(const std::shared_ptr<ServerParams>& cfg)
   _cfg->serverParamsVar("executorThreadNum")->setUpdate([this]() {
     resizeExecutorThreadNum(_cfg->executorThreadNum);
   });
+}
+
+ServerEntry::~ServerEntry() {
+  stop();
 }
 
 void ServerEntry::resetServerStat() {
@@ -295,83 +297,10 @@ Catalog* ServerEntry::getCatalog() {
 }
 
 void ServerEntry::logGeneral(Session* sess) {
-  if (!_generalLog) {
+  if (!_cfg->generalLog) {
     return;
   }
   LOG(INFO) << sess->getCmdStr();
-}
-
-// TODO(wayenchen)  takenliu add, delete this interface. use clusterManager's
-// function
-Status ServerEntry::delKeysInSlot(uint32_t slot) {
-  uint32_t storeId = _segmentMgr->getStoreid(slot);
-  LocalSessionGuard g(this);
-  // TODO(wayenchen) : lock chunk x, get db ix
-  auto expdb =
-    _segmentMgr->getDb(g.getSession(), storeId, mgl::LockMode::LOCK_IS);
-  if (!expdb.ok()) {
-    return expdb.status();
-  }
-  auto dbWithLock = std::make_unique<DbWithLock>(std::move(expdb.value()));
-  auto kvstore = dbWithLock->store;
-  auto ptxn = kvstore->createTransaction(NULL);
-  if (!ptxn.ok()) {
-    return ptxn.status();
-  }
-  auto slotCursor = std::move(ptxn.value()->createSlotCursor(slot));
-  while (true) {
-    Expected<Record> expRcd = slotCursor->next();
-    if (expRcd.status().code() == ErrorCodes::ERR_EXHAUST) {
-      break;
-    }
-    if (!expRcd.ok()) {
-      LOG(ERROR) << "delete cursor error on chunkid:" << slot;
-      return {ErrorCodes::ERR_CLUSTER, "delete Cursor error"};
-    }
-
-    Record& rcd = expRcd.value();
-    const RecordKey& rcdKey = rcd.getRecordKey();
-    auto s = ptxn.value()->delKV(rcdKey.encode());
-    if (!s.ok()) {
-      LOG(ERROR) << "delete key fail";
-      continue;
-    }
-  }
-  auto s = ptxn.value()->commit();
-  if (!s.ok()) {
-    return s.status();
-  }
-
-  return {ErrorCodes::ERR_OK, "finish delte keys in slot"};
-}
-
-/* NOTE(wayenchen) fast check if dbsize is zero or not */
-bool ServerEntry::containData() {
-  LocalSessionGuard g(this);
-  for (ssize_t i = 0; i < getKVStoreCount(); i++) {
-    auto expdb = _segmentMgr->getDb(g.getSession(), i, mgl::LockMode::LOCK_IS);
-    if (!expdb.ok()) {
-      LOG(ERROR) << "get db lock fail:" << expdb.status().toString();
-      return true;
-    }
-
-    PStore kvstore = expdb.value().store;
-    auto ptxn = kvstore->createTransaction(nullptr);
-    if (!ptxn.ok()) {
-      return true;
-    }
-    std::unique_ptr<Transaction> txn = std::move(ptxn.value());
-    auto cursor = txn->createDataCursor();
-    cursor->seek("");
-    auto exptRcd = cursor->next();
-
-    if (exptRcd.status().code() == ErrorCodes::ERR_EXHAUST) {
-      continue;
-    } else {
-      return true;
-    }
-  }
-  return false;
 }
 
 void ServerEntry::logWarning(const std::string& str, Session* sess) {
@@ -405,7 +334,7 @@ void ServerEntry::setBackupRunning() {
 }
 
 Status ServerEntry::adaptSomeThreadNumByCpuNum(
-        const std::shared_ptr<ServerParams>& cfg) {
+  const std::shared_ptr<ServerParams>& cfg) {
   // request executePool
   uint32_t cpuNum = std::thread::hardware_concurrency();
   if (cpuNum == 0) {
@@ -428,13 +357,13 @@ Status ServerEntry::adaptSomeThreadNumByCpuNum(
     threadnum = std::min(uint32_t(56), threadnum);
 
     if (threadnum % cfg->executorWorkPoolSize != 0) {
-      threadnum = (threadnum / cfg->executorWorkPoolSize + 1)
-        * cfg->executorWorkPoolSize;
+      threadnum =
+        (threadnum / cfg->executorWorkPoolSize + 1) * cfg->executorWorkPoolSize;
     }
 
     cfg->executorThreadNum = threadnum;
     LOG(INFO) << "adaptSomeThreadNumByCpuNum executorThreadNum:"
-      << cfg->executorThreadNum;
+              << cfg->executorThreadNum;
   }
 
   if (cfg->netIoThreadNum == 0) {
@@ -462,9 +391,10 @@ Status ServerEntry::startup(const std::shared_ptr<ServerParams>& cfg) {
 
   uint32_t kvStoreCount = cfg->kvStoreCount;
   uint32_t chunkSize = cfg->chunkSize;
+  _cursorMaps.resize(cfg->dbNum);
+  _keyCursorMaps.resize(cfg->dbNum);
 
   // set command config
-  Command::setNoExpire(cfg->noexpire);
   Command::changeCommand(gRenameCmdList, "rename");
   Command::changeCommand(gMappingCmdList, "mapping");
 
@@ -510,8 +440,9 @@ Status ServerEntry::startup(const std::shared_ptr<ServerParams>& cfg) {
   }
 
   // kvstore init
-  auto blockCache = rocksdb::NewLRUCache(
-    cfg->rocksBlockcacheMB * 1024 * 1024LL, 6, cfg->rocksStrictCapacityLimit);
+  _blockCache = rocksdb::NewLRUCache(
+    cfg->rocksBlockcacheMB * 1024 * 1024LL, cfg->rocksBlockcacheNumShardBits,
+    cfg->rocksStrictCapacityLimit);
   std::vector<PStore> tmpStores;
   tmpStores.reserve(kvStoreCount);
   for (size_t i = 0; i < kvStoreCount; ++i) {
@@ -537,7 +468,7 @@ Status ServerEntry::startup(const std::shared_ptr<ServerParams>& cfg) {
     tmpStores.emplace_back(
       std::unique_ptr<KVStore>(new RocksKVStore(std::to_string(i),
                                                 cfg,
-                                                blockCache,
+                                                _blockCache,
                                                 true,
                                                 mode,
                                                 RocksKVStore::TxnMode::TXN_PES,
@@ -561,7 +492,7 @@ Status ServerEntry::startup(const std::shared_ptr<ServerParams>& cfg) {
 
   installStoresInLock(tmpStores);
   INVARIANT_D(getKVStoreCount() == kvStoreCount);
-  LOG(INFO) << "enable cluster flag is" << _enableCluster;
+  LOG(INFO) << "enable cluster flag is " << _enableCluster;
 
   auto tmpSegMgr =
     std::unique_ptr<SegmentMgr>(new SegmentMgrFnvHash64(_kvstores, chunkSize));
@@ -575,7 +506,7 @@ Status ServerEntry::startup(const std::shared_ptr<ServerParams>& cfg) {
   installMGLockMgrInLock(std::move(tmpMGLockMgr));
 
   for (uint32_t i = 0; i < _cfg->executorThreadNum;
-    i += _cfg->executorWorkPoolSize) {
+       i += _cfg->executorWorkPoolSize) {
     // TODO(takenliu): make sure whether multi worker_pool is ok?
     // But each size of worker_pool should been not less than 8;
     // uint32_t i = 0;
@@ -595,6 +526,7 @@ Status ServerEntry::startup(const std::shared_ptr<ServerParams>& cfg) {
   }
 
   // set the executorThreadNum
+  _cfg->executorThreadNum = 0;
   for (auto& pool : _executorList) {
     _cfg->executorThreadNum += pool->size();
   }
@@ -651,14 +583,20 @@ Status ServerEntry::startup(const std::shared_ptr<ServerParams>& cfg) {
     }
   }
 
-  if (!cfg->noexpire) {
-    _indexMgr = std::make_unique<IndexManager>(shared_from_this(), cfg);
-    s = _indexMgr->startup();
-    if (!s.ok()) {
-      LOG(ERROR) << "ServerEntry::startup failed, _indexMgr->startup:"
-                 << s.toString();
-      return s;
-    }
+  _scriptMgr = std::make_unique<ScriptManager>(shared_from_this());
+  // TODO(takenliu): change executorThreadNum dynamic
+  s = _scriptMgr->startup(_cfg->executorThreadNum);
+  if (!s.ok()) {
+    LOG(WARNING) << "start up ScriptManager failed";
+    return s;
+  }
+
+  _indexMgr = std::make_unique<IndexManager>(shared_from_this(), cfg);
+  s = _indexMgr->startup();
+  if (!s.ok()) {
+    LOG(ERROR) << "ServerEntry::startup failed, _indexMgr->startup:"
+               << s.toString();
+    return s;
   }
 
   // listener should be the lastone to run.
@@ -682,6 +620,10 @@ Status ServerEntry::startup(const std::shared_ptr<ServerParams>& cfg) {
 
   // init slowlog
   _slowlogStat.initSlowlogFile(cfg->slowlogPath);
+
+  _lastJeprofDumpMemoryGB = 0;
+
+
   LOG(INFO) << "ServerEntry::startup sucess.";
   return {ErrorCodes::ERR_OK, ""};
 }
@@ -726,6 +668,10 @@ GCManager* ServerEntry::getGcMgr() {
   return _gcMgr.get();
 }
 
+ScriptManager* ServerEntry::getScriptMgr() {
+  return _scriptMgr.get();
+}
+
 std::string ServerEntry::requirepass() const {
   std::lock_guard<std::mutex> lk(_mutex);
   return _requirepass;
@@ -747,16 +693,18 @@ void ServerEntry::setMasterauth(const string& v) {
 }
 
 bool ServerEntry::versionIncrease() const {
-  return _versionIncrease;
+  return _cfg->versionIncrease;
 }
 
 bool ServerEntry::addSession(std::shared_ptr<Session> sess) {
-  std::lock_guard<std::mutex> lk(_mutex);
+  std::lock_guard<std::mutex> lk(_mutex_session);
   if (!_isRunning.load(std::memory_order_relaxed)) {
     LOG(WARNING) << "session:" << sess->id()
                  << " comes when stopping, ignore it";
     return false;
   }
+
+  INVARIANT_D(sess->getType() != Session::Type::LOCAL);
 
   // NOTE(deyukong): first driving force
   sess->start();
@@ -777,7 +725,7 @@ bool ServerEntry::addSession(std::shared_ptr<Session> sess) {
 }
 
 std::shared_ptr<Session> ServerEntry::getSession(uint64_t id) const {
-  std::lock_guard<std::mutex> lk(_mutex);
+  std::lock_guard<std::mutex> lk(_mutex_session);
   auto it = _sessions.find(id);
   if (it == _sessions.end()) {
     return nullptr;
@@ -787,12 +735,12 @@ std::shared_ptr<Session> ServerEntry::getSession(uint64_t id) const {
 }
 
 size_t ServerEntry::getSessionCount() {
-  std::lock_guard<std::mutex> lk(_mutex);
+  std::lock_guard<std::mutex> lk(_mutex_session);
   return _sessions.size();
 }
 
 Status ServerEntry::cancelSession(uint64_t connId) {
-  std::lock_guard<std::mutex> lk(_mutex);
+  std::lock_guard<std::mutex> lk(_mutex_session);
   if (!_isRunning.load(std::memory_order_relaxed)) {
     return {ErrorCodes::ERR_BUSY, "server is shutting down"};
   }
@@ -807,7 +755,7 @@ Status ServerEntry::cancelSession(uint64_t connId) {
 }
 //
 void ServerEntry::endSession(uint64_t connId) {
-  std::lock_guard<std::mutex> lk(_mutex);
+  std::lock_guard<std::mutex> lk(_mutex_session);
   if (!_isRunning.load(std::memory_order_relaxed)) {
     return;
   }
@@ -819,6 +767,9 @@ void ServerEntry::endSession(uint64_t connId) {
     LOG(ERROR) << "destroy conn:" << connId << ",not exists";
     return;
   }
+
+  INVARIANT_D(it->second->getType() != Session::Type::LOCAL);
+
   SessionCtx* pCtx = it->second->getCtx();
   INVARIANT(pCtx != nullptr);
   if (pCtx->getIsMonitor()) {
@@ -835,7 +786,7 @@ void ServerEntry::endSession(uint64_t connId) {
 }
 
 std::list<std::shared_ptr<Session>> ServerEntry::getAllSessions() const {
-  std::lock_guard<std::mutex> lk(_mutex);
+  std::lock_guard<std::mutex> lk(_mutex_session);
   uint64_t start = nsSinceEpoch();
   std::list<std::shared_ptr<Session>> sesses;
   for (const auto& kv : _sessions) {
@@ -850,7 +801,7 @@ std::list<std::shared_ptr<Session>> ServerEntry::getAllSessions() const {
 }
 
 void ServerEntry::AddMonitor(uint64_t sessId) {
-  std::lock_guard<std::mutex> lk(_mutex);
+  std::lock_guard<std::mutex> lk(_mutex_session);
   for (const auto& monSess : _monitors) {
     if (monSess->id() == sessId) {
       return;
@@ -939,12 +890,46 @@ void ServerEntry::resizeIncrExecutorThreadNum(uint64_t newThreadNum) {
   }
 }
 
+string catRepr(const string& val) {
+  size_t len = val.length();
+  size_t i = 0;
+  std::stringstream s;
+  s << "\"";
+  char buf[5];
+  while (i < len) {
+    switch (val[i]) {
+      case '\\':
+      case '"':
+        s << "\\" << val[i];
+        break;
+      case '\n': s << "\\n"; break;
+      case '\r': s << "\\r"; break;
+      case '\t': s << "\\t"; break;
+      case '\a': s << "\\a"; break;
+      case '\b': s << "\\b"; break;
+      default:
+        if (isprint(val[i])) {
+          s << val[i];
+        } else {
+          snprintf(buf, sizeof(buf), "\\x%02x", val[i]);
+          s << buf;
+        }
+        break;
+    }
+    i++;
+  }
+  s << "\"";
+  return s.str();
+}
+
+// TODO(takenliu) add gtest
 void ServerEntry::replyMonitors(Session* sess) {
   if (_monitors.size() <= 0) {
     return;
   }
 
-  std::string info = "+";
+  stringstream info;
+  info << "+";
 
   auto timeNow = std::chrono::duration_cast<std::chrono::microseconds>(
     std::chrono::system_clock::now().time_since_epoch());
@@ -954,21 +939,21 @@ void ServerEntry::replyMonitors(Session* sess) {
   INVARIANT(pCtx != nullptr);
   uint32_t dbId = pCtx->getDbId();
 
-  info += std::to_string(timestamp / 1000000) + "." +
+  info << std::to_string(timestamp / 1000000) << "." <<
     std::to_string(timestamp % 1000000);
-  info += " [" + std::to_string(dbId) + " " + sess->getRemote() + "] ";
+  info << " [" << std::to_string(dbId) << " " << sess->getRemote() << "] ";
   const auto& args = sess->getArgs();
   for (uint32_t i = 0; i < args.size(); ++i) {
-    info += "\"" + args[i] + "\"";
+    info << catRepr(args[i]);
     if (i != (args.size() - 1)) {
-      info += " ";
+      info << " ";
     }
   }
-  info += "\r\n";
+  info << "\r\n";
 
-  std::lock_guard<std::mutex> lk(_mutex);
+  std::lock_guard<std::mutex> lk(_mutex_session);
   for (auto iter = _monitors.begin(); iter != _monitors.end();) {
-    auto s = (*iter)->setResponse(info);
+    auto s = (*iter)->setResponse(info.str());
     if (!s.ok()) {
       iter = _monitors.erase(iter);
     } else {
@@ -1049,7 +1034,6 @@ bool ServerEntry::processRequest(Session* sess) {
         ns->borrowConn(), args[1], args[2], args[3], storeNum);
       return false;
     } else if (expCmdName == "quit") {
-      LOG(INFO) << "quit command";
       NetSession* ns = dynamic_cast<NetSession*>(sess);
       INVARIANT(ns != nullptr);
       ns->setCloseAfterRsp();
@@ -1058,6 +1042,28 @@ bool ServerEntry::processRequest(Session* sess) {
         return false;
       }
       return true;
+    } else if (expCmdName == "psync") {
+      NetSession* ns = dynamic_cast<NetSession*>(sess);
+      INVARIANT(ns != nullptr);
+
+      if (!_cfg->aofEnabled) {
+        ns->setResponse(Command::fmtErr("aof psync enable first"));
+        return true;
+      }
+
+      std::vector<std::string> args = ns->getArgs();
+      if (args[1] != "?" || args[2] != "-1") {
+        ns->setResponse(Command::fmtErr("just support ? -1"));
+        return true;
+      }
+
+      if (args[3].empty()) {
+        ns->setResponse(Command::fmtErr("need rocksdb number"));
+        return true;
+      }
+
+      _replMgr->supplyFullPsync(ns->borrowConn(), args[3]);
+      return false;
     }
   }
 
@@ -1186,7 +1192,8 @@ void ServerEntry::appendJSONStat(
 
 bool ServerEntry::getTotalIntProperty(Session* sess,
                                       const std::string& property,
-                                      uint64_t* value) const {
+                                      uint64_t* value,
+                                      ColumnFamilyNumber cf) const {
   *value = 0;
   for (uint64_t i = 0; i < getKVStoreCount(); i++) {
     auto expdb =
@@ -1197,13 +1204,58 @@ bool ServerEntry::getTotalIntProperty(Session* sess,
 
     auto store = expdb.value().store;
     uint64_t tmp = 0;
-    bool ok = store->getIntProperty(property, &tmp);
+    bool ok = store->getIntProperty(property, &tmp, cf);
     if (!ok) {
       return false;
     }
     *value += tmp;
   }
 
+  return true;
+}
+
+uint64_t ServerEntry::getStatCountByName(Session* sess,
+  const std::string& ticker) const {
+  uint64_t value = 0;
+  for (uint64_t i = 0; i < getKVStoreCount(); i++) {
+    auto expdb =
+      getSegmentMgr()->getDb(sess, i, mgl::LockMode::LOCK_IS, false, 0);
+    if (!expdb.ok()) {
+      return 0;
+    }
+
+    auto store = expdb.value().store;
+    value += store->getStatCountByName(ticker);
+  }
+
+  return value;
+}
+
+bool ServerEntry::isDbEmpty() {
+  for (uint32_t i = 0; i < getKVStoreCount(); ++i) {
+    auto expdb = getSegmentMgr()->getDb(nullptr, i, mgl::LockMode::LOCK_IS);
+    if (!expdb.ok()) {
+      LOG(ERROR) << "get db lock fail:" << expdb.status().toString();
+      return false;
+    }
+
+    auto kvstore = std::move(expdb.value().store);
+    auto eTxn = kvstore->createTransaction(nullptr);
+    if (!eTxn.ok()) {
+      LOG(ERROR) << "createTransaction failed:" << eTxn.status().toString();
+      return false;
+    }
+
+    auto cursor = eTxn.value()->createDataCursor();
+    cursor->seek("");
+    auto exptRcd = cursor->next();
+
+    if (exptRcd.status().code() == ErrorCodes::ERR_EXHAUST) {
+      continue;
+    } else {
+      return false;
+    }
+  }
   return true;
 }
 
@@ -1314,6 +1366,13 @@ Status ServerEntry::destroyStore(Session* sess,
     return status;
   }
 
+  status = _scriptMgr->stopStore(storeId);
+  if (!status.ok()) {
+    LOG(ERROR) << "_scriptMgr stopStore :" << storeId
+               << " failed:" << status.toString();
+    return status;
+  }
+
   if (_indexMgr) {
     status = _indexMgr->stopStore(storeId);
     if (!status.ok()) {
@@ -1412,8 +1471,52 @@ void ServerEntry::serverCron() {
       }
     }
 
+    run_with_period(1000) {
+      _scriptMgr->cron();
+    }
+
+    if (_cfg->jeprofAutoDump) {
+      run_with_period(1000) {
+        jeprofCron();
+      }
+    }
+
     cronLoop++;
   }
+}
+
+void ServerEntry::jeprofCron() {
+#ifndef _WIN32
+  size_t rss_human_size = 0;
+  ifstream file;
+  file.open("/proc/self/status");
+  if (file.is_open()) {
+    string strline;
+    while (getline(file, strline)) {
+      auto v = stringSplit(strline, ":");
+      if (v.size() != 2) {
+        continue;
+      }
+      if (v[0] == "VmRSS") {  // physic memory
+        string used_memory_rss_human = trim(v[1]);
+        strDelete(used_memory_rss_human, ' ');
+        auto s = getIntSize(used_memory_rss_human);
+        if (s.ok()) {
+          rss_human_size = s.value();
+        } else {
+          LOG(ERROR) << "getIntSize failed:" << s.status().toString();
+        }
+      }
+    }
+  }
+  uint32_t memoryGb = rss_human_size/1024/1024/1024;
+  if (memoryGb > _lastJeprofDumpMemoryGB) {
+    _lastJeprofDumpMemoryGB = memoryGb;
+    LOG(INFO) << "jeprof dump memoryGb:" << memoryGb;
+
+    mallctl("prof.dump", NULL, NULL, NULL, 0);
+  }
+#endif  // !_WIN32
 }
 
 void ServerEntry::waitStopComplete() {
@@ -1456,6 +1559,10 @@ void ServerEntry::stop() {
   _isRunning.store(false, std::memory_order_relaxed);
   _eventCV.notify_all();
   _network->stop();
+
+  // NOTE(takenliu): _scriptMgr need stop earlier than _executorList
+  _scriptMgr->stop();
+
   for (auto& executor : _executorList) {
     executor->stop();
   }
@@ -1468,7 +1575,7 @@ void ServerEntry::stop() {
   if (_indexMgr)
     _indexMgr->stop();
   {
-    std::lock_guard<std::mutex> lk(_mutex);
+    std::lock_guard<std::mutex> lk(_mutex_session);
     _sessions.clear();
   }
   if (_clusterMgr) {
@@ -1477,6 +1584,7 @@ void ServerEntry::stop() {
   if (_gcMgr) {
     _gcMgr->stop();
   }
+
   if (!_isShutdowned.load(std::memory_order_relaxed)) {
     // NOTE(vinchen): if it's not the shutdown command, it should reset the
     // workerpool to decr the referent count of share_ptr<server>
@@ -1493,6 +1601,7 @@ void ServerEntry::stop() {
     _segmentMgr.reset();
     _clusterMgr.reset();
     _gcMgr.reset();
+    _scriptMgr.reset();
   }
 
   // stop the rocksdb
@@ -1552,6 +1661,16 @@ void ServerEntry::slowlogPushEntryIfNeeded(uint64_t time,
 std::shared_ptr<ServerEntry>& getGlobalServer() {
   static std::shared_ptr<ServerEntry> gServer;
   return gServer;
+}
+
+/**
+ * @brief check whether slot belong to this kvstore
+ * @param kvstoreId kvstoreId which slots belong to
+ * @param slot slot which need to check
+ * @return boolean, show whether slot belong to this kvstore
+ */
+bool checkKvstoreSlot(uint32_t kvstoreId, uint64_t slot) {
+  return (slot % getGlobalServer()->getParams()->kvStoreCount) == kvstoreId;
 }
 
 }  // namespace tendisplus

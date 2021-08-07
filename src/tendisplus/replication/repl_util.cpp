@@ -57,8 +57,8 @@ Expected<BinlogResult> masterSendBinlogV2(
   bool needHeartBeart,
   std::shared_ptr<ServerEntry> svr,
   const std::shared_ptr<ServerParams> cfg) {
-  uint32_t suggestBatch = svr->getParams()->bingLogSendBatch;
-  size_t suggestBytes = svr->getParams()->bingLogSendBytes;
+  uint32_t suggestBatch = svr->getParams()->binlogSendBatch;
+  size_t suggestBytes = svr->getParams()->binlogSendBytes;
 
   LocalSessionGuard sg(svr.get());
   sg.getSession()->setArgs({"mastersendlog",
@@ -186,6 +186,101 @@ Expected<BinlogResult> masterSendBinlogV2(
   }
 }
 
+Expected<BinlogResult> masterSendAof(BlockingTcpClient* client,
+                                     uint32_t storeId,
+                                     uint32_t dstStoreId,
+                                     uint64_t binlogPos,
+                                     bool needHeartBeart,
+                                     std::shared_ptr<ServerEntry> svr,
+                                     const std::shared_ptr<ServerParams> cfg) {
+  LocalSessionGuard sg(svr.get());
+
+  sg.getSession()->setArgs({"mastersendlog",
+                            std::to_string(storeId),
+                            client->getRemoteRepr(),
+                            std::to_string(dstStoreId),
+                            std::to_string(binlogPos)});
+
+  auto expdb = svr->getSegmentMgr()->getDb(
+    sg.getSession(), storeId, mgl::LockMode::LOCK_IS);
+  if (!expdb.ok()) {
+    return expdb.status();
+  }
+  auto store = std::move(expdb.value().store);
+  INVARIANT(store != nullptr);
+
+  auto ptxn = store->createTransaction(sg.getSession());
+  if (!ptxn.ok()) {
+    return ptxn.status();
+  }
+
+  BinlogResult br;
+  std::unique_ptr<Transaction> txn = std::move(ptxn.value());
+  std::unique_ptr<RepllogCursorV2> cursor =
+    txn->createRepllogCursorV2(binlogPos + 1);
+
+  std::stringstream ss;
+  std::string cmdStr = "";
+  uint16_t cmdNum = 0;
+  uint32_t aofPsyncNum = svr->getParams()->aofPsyncNum;
+  while (true) {
+    Expected<ReplLogRawV2> explog = cursor->next();
+    if (explog.ok()) {
+      br.binlogId = explog.value().getBinlogId();
+      br.binlogTs = explog.value().getTimestamp();
+
+      std::string value = explog.value().getReplLogValue();
+      Expected<ReplLogValueV2> logValue = ReplLogValueV2::decode(value);
+
+      if (!logValue.ok()) {
+        LOG(ERROR) << "decode logvalue failed." << logValue.status().toString();
+        return logValue.status();
+      }
+      cmdStr = logValue.value().getCmd();
+
+      ss << cmdStr;
+      if ((++cmdNum) > aofPsyncNum) {
+        break;
+      }
+
+    } else if (explog.status().code() == ErrorCodes::ERR_EXHAUST) {
+      // no more data
+      break;
+    } else {
+      LOG(ERROR) << "iter binlog failed:" << explog.status().toString();
+      return explog.status();
+    }
+  }
+  if (cmdNum == 0) {
+    br.binlogId = binlogPos;
+    br.binlogTs = 0;
+    if (!needHeartBeart) {
+      return br;
+    }
+    // keep the client alive
+    // TODO(wayenchen) if send PING or binglog_heart, need read data to avoid
+    // client error
+    if (svr->getParams()->psyncEnabled) {
+      Command::fmtMultiBulkLen(ss, 3);
+      Command::fmtBulk(ss, "binlog_heartbeat");
+      Command::fmtBulk(ss, std::to_string(dstStoreId));
+      Command::fmtBulk(ss, std::to_string(br.binlogTs));
+    } else {
+      Command::fmtMultiBulkLen(ss, 1);
+      Command::fmtBulk(ss, "PING");
+    }
+  }
+  Status s = client->writeData(ss.str());
+  if (!s.ok()) {
+    LOG(ERROR) << "store:" << storeId << " dst Store:" << dstStoreId
+               << " writeData failed:" << s.toString()
+               << "remote:" << client->getRemoteRepr()
+               << "; Size:" << cmdStr.size();
+    return s;
+  }
+  return br;
+}
+
 Expected<BinlogResult> applySingleTxnV2(Session* sess,
                                         uint32_t storeId,
                                         const std::string& logKey,
@@ -258,7 +353,7 @@ Expected<BinlogResult> applySingleTxnV2(Session* sess,
       string err = "binlogId:" + to_string(binlogId) +
         " can't be smaller than highestBinlogId:" +
         to_string(store->getHighestBinlogId());
-      LOG(ERROR) << err;
+      LOG(ERROR) << err << " storeid:" << storeId;
       return {ErrorCodes::ERR_MANUAL, err};
     }
 
@@ -356,8 +451,8 @@ Status SendSlotsBinlog(BlockingTcpClient* client,
                        uint64_t* newBinlogId,
                        bool* needRetry,
                        uint64_t* binlogTimeStamp) {
-  uint32_t suggestBatch = svr->getParams()->bingLogSendBatch;
-  size_t suggestBytes = svr->getParams()->bingLogSendBytes;
+  uint32_t suggestBatch = svr->getParams()->binlogSendBatch;
+  size_t suggestBytes = svr->getParams()->binlogSendBytes;
   uint32_t timeoutSecs = svr->getParams()->timeoutSecBinlogWaitRsp;
 
   LocalSessionGuard sg(svr.get());
@@ -380,8 +475,9 @@ Status SendSlotsBinlog(BlockingTcpClient* client,
     return ptxn.status();
   }
   std::unique_ptr<Transaction> txn = std::move(ptxn.value());
+  // cursor need ignore readbarrier
   std::unique_ptr<RepllogCursorV2> cursor =
-    txn->createRepllogCursorV2(binlogPos + 1);
+    txn->createRepllogCursorV2(binlogPos + 1, true);
 
   std::unique_ptr<BinlogWriter> writer =
     std::make_unique<BinlogWriter>(suggestBytes, suggestBatch);

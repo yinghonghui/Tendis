@@ -30,8 +30,7 @@ string gMappingCmdList = "";  // NOLINT
 
 #define REGISTER_VARS_FULL(                                                   \
   str, var, checkfun, prefun, minval, maxval, allowDynamicSet)                \
-  if (typeid(var) == typeid(int32_t) || typeid(var) == typeid(uint32_t) ||    \
-      typeid(var) == typeid(uint16_t))                                        \
+  if (typeid(var) == typeid(int32_t) || typeid(var) == typeid(uint32_t))      \
     _mapServerParams.insert(                                                  \
       make_pair(toLower(str),                                                 \
                 new IntVar(str,                                               \
@@ -91,7 +90,7 @@ string gMappingCmdList = "";  // NOLINT
   REGISTER_VARS_FULL(                                     \
     #var, var, checkfun, prefun, minval, maxval, allowDynamicSet)
 
-bool logLevelParamCheck(const string& val) {
+bool logLevelParamCheck(const string& val, bool startup, string* errinfo) {
   auto v = toLower(val);
   if (v == "debug" || v == "verbose" || v == "notice" || v == "warning") {
     return true;
@@ -99,7 +98,7 @@ bool logLevelParamCheck(const string& val) {
   return false;
 }
 
-bool compressTypeParamCheck(const string& val) {
+bool compressTypeParamCheck(const string& val, bool startup, string* errinfo) {
   auto v = toLower(val);
   if (v == "snappy" || v == "lz4" || v == "none") {
     return true;
@@ -107,14 +106,85 @@ bool compressTypeParamCheck(const string& val) {
   return false;
 }
 
-bool executorThreadNumCheck(const std::string& val) {
+bool executorThreadNumCheck(
+        const std::string& val, bool startup, string* errinfo) {
   auto num = std::strtoull(val.c_str(), nullptr, 10);
-  if (!getGlobalServer()) {
+  if (startup || !gParams || gParams->executorWorkPoolSize == 0) {
     return true;
   }
-  auto workPoolSize = getGlobalServer()->getParams()->executorWorkPoolSize;
+  auto workPoolSize = gParams->executorWorkPoolSize;
 
-  return (num % workPoolSize) ? false : true;
+  if (num % workPoolSize) {
+    if (errinfo != NULL) {
+      *errinfo = "need executorThreadNum % executorWorkPoolSize == 0";
+    }
+    return false;
+  }
+  return true;
+}
+
+bool binlogDelRangeCheck(
+        const std::string& val, bool startup, string* errinfo) {
+  auto num = std::strtoull(val.c_str(), nullptr, 10);
+  if (startup || !gParams) {
+    return true;
+  }
+  auto truncateBinlogNum = gParams->truncateBinlogNum;
+  if (num > truncateBinlogNum) {
+    if (errinfo != NULL) {
+      *errinfo = "need binlogDelRange < truncateBinlogNum";
+    }
+    return false;
+  }
+  return true;
+}
+
+bool aofEnabledCheck(const std::string& val, bool startup, string* errinfo) {
+  bool v = isOptionOn(val);
+  if (startup || !gParams) {
+    return true;
+  }
+  if (!v && gParams->psyncEnabled) {
+    if (errinfo != NULL) {
+      *errinfo = "can't disable aofEnabled when psyncEnabled is yes";
+    }
+    return false;
+  }
+
+  return true;
+}
+
+bool truncateBinlogNumCheck(
+        const std::string& val, bool startup, string* errinfo) {
+  auto num = std::strtoull(val.c_str(), nullptr, 10);
+  if (startup || !gParams) {
+    return true;
+  }
+  auto binlogDelRange = gParams->binlogDelRange;
+  if (num < binlogDelRange) {
+    if (errinfo != NULL) {
+      *errinfo = "need binlogDelRange < truncateBinlogNum";
+    }
+    return false;
+  }
+  return true;
+}
+
+
+bool deleteFilesInRangeforBinlogCheck(
+        const std::string& val, bool startup, string* errinfo) {
+  if (startup || !gParams) {
+    return true;
+  }
+  bool value = isOptionOn(val);
+  if (!gParams->saveMinBinlogId && value) {
+    if (errinfo != NULL) {
+      *errinfo =
+        "set deleteFilesInRangeforBinlog=true need saveMinBinlogId==ture";
+    }
+    return false;
+  }
+  return true;
 }
 
 string removeQuotes(const string& v) {
@@ -279,6 +349,7 @@ ServerParams::ServerParams() {
                      -1,
                      false);
   REGISTER_VARS(logDir);
+  REGISTER_VARS(daemon);
 
   REGISTER_VARS_DIFF_NAME("storage", storageEngine);
   REGISTER_VARS_DIFF_NAME("dir", dbPath);
@@ -286,28 +357,32 @@ ServerParams::ServerParams() {
   REGISTER_VARS(requirepass);
   REGISTER_VARS(masterauth);
   REGISTER_VARS(pidFile);
-  REGISTER_VARS_DIFF_NAME("version-increase", versionIncrease);
-  REGISTER_VARS(generalLog);
+  REGISTER_VARS_DIFF_NAME_DYNAMIC("version-increase", versionIncrease);
+  REGISTER_VARS_ALLOW_DYNAMIC_SET(generalLog);
   // false: For command "set a b", it don't check the type of
   // "a" and update it directly. It can make set() faster.
   // Default false. Redis layer can guarantee that it's safe
-  REGISTER_VARS_DIFF_NAME("checkkeytypeforsetcmd", checkKeyTypeForSet);
+  REGISTER_VARS_DIFF_NAME_DYNAMIC("checkkeytypeforsetcmd", checkKeyTypeForSet);
 
+  /* Disable parameter chunkSize because MACRO `CLUSTER_SLOTS` using everywhere
   REGISTER_VARS(chunkSize);
+   */
   REGISTER_VARS(kvStoreCount);
+  REGISTER_VARS_DIFF_NAME("chunkSize", fakeChunkSize);
 
-  REGISTER_VARS(scanCntIndexMgr);
-  REGISTER_VARS(scanJobCntIndexMgr);
-  REGISTER_VARS(delCntIndexMgr);
-  REGISTER_VARS(delJobCntIndexMgr);
-  REGISTER_VARS(pauseTimeIndexMgr);
+  REGISTER_VARS_SAME_NAME(scanCntIndexMgr, nullptr, nullptr, 1, 1000000, true);
+  REGISTER_VARS_SAME_NAME(scanJobCntIndexMgr, nullptr, nullptr, 1, 200, true);
+  REGISTER_VARS_SAME_NAME(delCntIndexMgr, nullptr, nullptr, 1, 1000000, true);
+  REGISTER_VARS_SAME_NAME(delJobCntIndexMgr, nullptr, nullptr, 1, 200, true);
+  REGISTER_VARS_SAME_NAME(
+    pauseTimeIndexMgr, nullptr, nullptr, 1, INT_MAX, true);
 
   REGISTER_VARS_DIFF_NAME("proto-max-bulk-len", protoMaxBulkLen);
   REGISTER_VARS_DIFF_NAME("databases", dbNum);
 
-  REGISTER_VARS(noexpire);
+  REGISTER_VARS_ALLOW_DYNAMIC_SET(noexpire);
   REGISTER_VARS_SAME_NAME(
-    maxBinlogKeepNum, nullptr, nullptr, 1, 10000000000000, true);
+    maxBinlogKeepNum, nullptr, nullptr, 1, INT64_MAX, true);
   REGISTER_VARS_ALLOW_DYNAMIC_SET(minBinlogKeepSec);
   REGISTER_VARS_ALLOW_DYNAMIC_SET(slaveBinlogKeepNum);
 
@@ -330,25 +405,46 @@ ServerParams::ServerParams() {
   REGISTER_VARS_SAME_NAME(
     executorWorkPoolSize, nullptr, nullptr, 1, 200, false);
 
-  REGISTER_VARS(binlogRateLimitMB);
-  REGISTER_VARS(netBatchSize);
-  REGISTER_VARS(netBatchTimeoutSec);
-  REGISTER_VARS(timeoutSecBinlogWaitRsp);
+  REGISTER_VARS_ALLOW_DYNAMIC_SET(binlogRateLimitMB);
+  // Only works on newly created connections(BlockingTcpClient)
+  REGISTER_VARS_ALLOW_DYNAMIC_SET(netBatchSize);
+  REGISTER_VARS_ALLOW_DYNAMIC_SET(netBatchTimeoutSec);
+  REGISTER_VARS_ALLOW_DYNAMIC_SET(timeoutSecBinlogWaitRsp);
   REGISTER_VARS_SAME_NAME(incrPushThreadnum, nullptr, nullptr, 1, 200, true);
   REGISTER_VARS_SAME_NAME(fullPushThreadnum, nullptr, nullptr, 1, 200, true);
   REGISTER_VARS_SAME_NAME(fullReceiveThreadnum, nullptr, nullptr, 1, 200, true);
   REGISTER_VARS_SAME_NAME(logRecycleThreadnum, nullptr, nullptr, 1, 200, true);
-  REGISTER_VARS_FULL("truncateBinlogIntervalMs", truncateBinlogIntervalMs,
-    NULL, NULL, 10, 5000, true)
-  REGISTER_VARS_ALLOW_DYNAMIC_SET(truncateBinlogNum);
-  REGISTER_VARS(binlogFileSizeMB);
-  REGISTER_VARS(binlogFileSecs);
-  REGISTER_VARS(binlogDelRange);
+
+  REGISTER_VARS_FULL("truncateBinlogIntervalMs",
+                     truncateBinlogIntervalMs,
+                     NULL,
+                     NULL,
+                     10,
+                     5000,
+                     true);
+  REGISTER_VARS_SAME_NAME(
+    truncateBinlogNum, truncateBinlogNumCheck, nullptr, 1, INT_MAX, true);
+  REGISTER_VARS_ALLOW_DYNAMIC_SET(binlogFileSizeMB);
+  REGISTER_VARS_ALLOW_DYNAMIC_SET(binlogFileSecs);
+  REGISTER_VARS_SAME_NAME(
+    binlogDelRange, binlogDelRangeCheck, nullptr, 1, 100000000, true);
+  REGISTER_VARS_DIFF_NAME_DYNAMIC("binlog-send-batch", binlogSendBatch);
+  REGISTER_VARS_DIFF_NAME_DYNAMIC("binlog-send-bytes", binlogSendBytes);
 
   REGISTER_VARS_ALLOW_DYNAMIC_SET(keysDefaultLimit);
   REGISTER_VARS_ALLOW_DYNAMIC_SET(lockWaitTimeOut);
+  REGISTER_VARS_ALLOW_DYNAMIC_SET(lockDbXWaitTimeout);
+  REGISTER_VARS_DIFF_NAME("binlog-using-defaultCF", binlogUsingDefaultCF);
+
+  REGISTER_VARS_ALLOW_DYNAMIC_SET(scanDefaultLimit);
+  REGISTER_VARS_SAME_NAME(
+    scanDefaultMaxIterateTimes, nullptr, nullptr, 10, 10000, true);
 
   REGISTER_VARS_DIFF_NAME("rocks.blockcachemb", rocksBlockcacheMB);
+
+  REGISTER_VARS_FULL("rocks.blockcache_num_shard_bits",
+                    rocksBlockcacheNumShardBits,
+                    nullptr, nullptr, -1, 19, false);
   REGISTER_VARS_DIFF_NAME("rocks.blockcache_strict_capacity_limit",
                           rocksStrictCapacityLimit);
   REGISTER_VARS_DIFF_NAME_DYNAMIC("rocks.disable_wal", rocksDisableWAL);
@@ -375,6 +471,10 @@ ServerParams::ServerParams() {
 
   REGISTER_VARS_DIFF_NAME("cluster-enabled", clusterEnabled);
   REGISTER_VARS_DIFF_NAME("domain-enabled", domainEnabled);
+  REGISTER_VARS_FULL(
+    "aof-enabled", aofEnabled, aofEnabledCheck, nullptr, 0, INT_MAX, true);
+  REGISTER_VARS_DIFF_NAME_DYNAMIC("aof-psync-num", aofPsyncNum);
+
   REGISTER_VARS_DIFF_NAME_DYNAMIC("slave-migrate-enabled",
                                   slaveMigarateEnabled);
   REGISTER_VARS_DIFF_NAME_DYNAMIC("migrate-gc-enabled", enableGcInMigate);
@@ -392,18 +492,29 @@ ServerParams::ServerParams() {
                                   migrateBinlogIter);
   REGISTER_VARS_DIFF_NAME_DYNAMIC("cluster-migration-slots-num-per-task",
                                   migrateTaskSlotsLimit);
+  REGISTER_VARS_DIFF_NAME_DYNAMIC("migrate-snapshot-key-num",
+                                  migrateSnapshotKeyNum);
   REGISTER_VARS_DIFF_NAME_DYNAMIC("cluster-migration-rate-limit",
                                   migrateRateLimitMB);
   REGISTER_VARS_DIFF_NAME_DYNAMIC("migrate-snapshot-retry-num",
                                   snapShotRetryCnt);
-  REGISTER_VARS_DIFF_NAME_DYNAMIC("binlog-send-batch", bingLogSendBatch);
-  REGISTER_VARS_DIFF_NAME_DYNAMIC("binlog-send-bytes", bingLogSendBytes);
   REGISTER_VARS_DIFF_NAME_DYNAMIC("cluster-migration-barrier",
                                   clusterMigrationBarrier);
   REGISTER_VARS_DIFF_NAME_DYNAMIC("cluster-slave-validity-factor",
                                   clusterSlaveValidityFactor);
-  REGISTER_VARS_DIFF_NAME_DYNAMIC("binlog-using-defaultCF",
-                                  binlogUsingDefaultCF);
+
+  REGISTER_VARS_DIFF_NAME_DYNAMIC("force-recovery", forceRecovery);
+
+  REGISTER_VARS_DIFF_NAME_DYNAMIC("lua-time-limit", luaTimeLimit);
+  REGISTER_VARS(luaStateMaxIdleTime);
+  REGISTER_VARS_DIFF_NAME_DYNAMIC("jeprof-auto-dump", jeprofAutoDump);
+  REGISTER_VARS_DIFF_NAME_DYNAMIC("compactrange-after-deleterange",
+                                  compactRangeAfterDeleteRange);
+  REGISTER_VARS_DIFF_NAME_DYNAMIC("save-min-binlogid",
+                                  saveMinBinlogId);
+  REGISTER_VARS_FULL(
+          "deletefilesinrange-for-binlog", deleteFilesInRangeforBinlog,
+          deleteFilesInRangeforBinlogCheck, nullptr, -1, -1, true);
 }
 
 ServerParams::~ServerParams() {
@@ -454,10 +565,14 @@ Status ServerParams::parseFile(const std::string& filename) {
             LOG(ERROR) << "parseFile include file failed: " << tokens[1];
             return ret;
           }
-        } else if (!setVar(tokens[0], tokens[1], NULL)) {
-          LOG(ERROR) << "err arg:" << tokens[0] << " " << tokens[1];
-          return {ErrorCodes::ERR_PARSEOPT,
-                  "invalid parameter " + tokens[0] + " value: " + tokens[1]};
+        } else {
+          auto s = setVar(tokens[0], tokens[1]);
+          if (!s.ok()) {
+            LOG(ERROR) << "invalid parameter:" << tokens[0] << " " << tokens[1]
+                       << " " << s.toString();
+            return {ErrorCodes::ERR_PARSEOPT,
+                    "invalid parameter " + tokens[0] + " value: " + tokens[1]};
+          }
         }
       } else {
         LOG(ERROR) << "err arg:" << line;
@@ -469,40 +584,130 @@ Status ServerParams::parseFile(const std::string& filename) {
                << " line:" << line;
     return {ErrorCodes::ERR_PARSEOPT, ""};
   }
+
+  auto s = checkParams();
+  if (!s.ok()) {
+    return s;
+  }
   _confFile = filename;
   return {ErrorCodes::ERR_OK, ""};
 }
 
-bool ServerParams::setVar(const string& name,
-                          const string& value,
-                          string* errinfo,
-                          bool force) {
-  auto iter = _mapServerParams.find(toLower(name));
-  if (iter == _mapServerParams.end()) {
-    if (name.substr(0, 6) == "rocks.") {
-      auto ed = tendisplus::stoll(value);
-      if (!ed.ok()) {
-        if (errinfo != NULL)
-          *errinfo = "invalid rocksdb options:" + name + " value:" + value;
-
-        return false;
-      }
-
-      _rocksdbOptions.insert(
-        make_pair(toLower(name.substr(6, name.length())), ed.value()));
-      return true;
-    }
-
-    if (errinfo != NULL)
-      *errinfo = "not found arg:" + name;
-    return false;
+// if need check, add in this function
+Status ServerParams::checkParams() {
+  if (executorWorkPoolSize != 0 && executorThreadNum % executorWorkPoolSize) {
+    return {ErrorCodes::ERR_INTERNAL,
+            "need executorThreadNum % executorWorkPoolSize == 0"};
   }
-  if (!force) {
-    LOG(INFO) << "ServerParams setVar dynamic," << name << " : " << value;
+
+  if (binlogDelRange > truncateBinlogNum) {
+    LOG(ERROR) << "not allow binlogDelRange > truncateBinlogNum : "
+               << binlogDelRange << " > " << truncateBinlogNum;
+    return {ErrorCodes::ERR_INTERNAL,
+            "not allow binlogDelRange > truncateBinlogNum"};
   }
-  return iter->second->setVar(value, errinfo, force);
+
+  if (psyncEnabled && !aofEnabled) {
+    auto err = "psyncEnabled is not allowed when aofEnable is 0";
+    LOG(ERROR) << err;
+    return {ErrorCodes::ERR_INTERNAL, err};
+  }
+
+  if (scanJobCntIndexMgr > kvStoreCount) {
+    LOG(INFO) << "`scanJobCntIndexMgr` is not allowed to be greater than "
+                 "`kvstorecount`, set from "
+              << scanJobCntIndexMgr << " to " << kvStoreCount;
+    scanCntIndexMgr = kvStoreCount;
+  }
+
+  if (delJobCntIndexMgr > kvStoreCount) {
+    LOG(INFO) << "`delJobCntIndexMgr` is not allowed to be greater than "
+                 "`kvstorecount`, set from "
+              << delJobCntIndexMgr << " to " << kvStoreCount;
+    delJobCntIndexMgr = kvStoreCount;
+  }
+
+  if (incrPushThreadnum > kvStoreCount) {
+    LOG(INFO) << "`incrPushThreadnum` is not allowed to be greater than "
+                 "`kvstorecount`, set from "
+              << incrPushThreadnum << " to " << kvStoreCount;
+    incrPushThreadnum = kvStoreCount;
+  }
+
+  if (fullPushThreadnum > kvStoreCount) {
+    LOG(INFO) << "`fullPushThreadnum` is not allowed to be greater than "
+                 "`kvstorecount`, set from "
+              << fullPushThreadnum << " to " << kvStoreCount;
+    fullPushThreadnum = kvStoreCount;
+  }
+
+  if (fullReceiveThreadnum > kvStoreCount) {
+    LOG(INFO) << "`fullReceiveThreadnum` is not allowed to be greater than "
+                 "`kvstorecount`, set from "
+              << fullReceiveThreadnum << " to " << kvStoreCount;
+    fullReceiveThreadnum = kvStoreCount;
+  }
+
+  if (logRecycleThreadnum > kvStoreCount) {
+    LOG(INFO) << "`logRecycleThreadnum` is not allowed to be greater than "
+                 "`kvstorecount`, set from "
+              << logRecycleThreadnum << " to " << kvStoreCount;
+    logRecycleThreadnum = kvStoreCount;
+  }
+
+  if (!saveMinBinlogId && deleteFilesInRangeforBinlog) {
+    auto err =
+      "set deleteFilesInRangeforBinlog=true need saveMinBinlogId==ture";
+    LOG(ERROR) << err;
+    return {ErrorCodes::ERR_INTERNAL, err};
+  }
+  return {ErrorCodes::ERR_OK, ""};
 }
 
+Status ServerParams::setVar(const string& name,
+                            const string& value,
+                            bool startup) {
+  string errinfo;
+  auto argname = toLower(name);
+  auto iter = _mapServerParams.find(toLower(name));
+  if (iter == _mapServerParams.end()) {
+    if (argname.substr(0, 6) == "rocks.") {
+      auto ed = tendisplus::stoll(value);
+      if (!ed.ok()) {
+        errinfo = "invalid rocksdb options:" + argname + " value:" + value +
+          " " + ed.status().toString();
+        return {ErrorCodes::ERR_PARSEOPT, errinfo};
+      }
+
+      if (startup) {
+        _rocksdbOptions.insert(
+          make_pair(toLower(argname.substr(6, argname.length())), ed.value()));
+        return {ErrorCodes::ERR_OK, ""};
+      } else {
+        auto server = getGlobalServer();
+        LocalSessionGuard sg(server.get());
+        for (uint64_t i = 0; i < server->getKVStoreCount(); i++) {
+          auto expStore = server->getSegmentMgr()->getDb(
+            sg.getSession(), i, mgl::LockMode::LOCK_IS);
+          RET_IF_ERR_EXPECTED(expStore);
+
+          // change rocksdb options dynamically
+          auto s = expStore.value().store->setOption(argname, ed.value());
+          RET_IF_ERR(s);
+        }
+
+        return {ErrorCodes::ERR_OK, ""};
+      }
+    }
+
+    errinfo = "not found arg:" + argname;
+    return {ErrorCodes::ERR_PARSEOPT, errinfo};
+  }
+  if (!startup) {
+    LOG(INFO) << "ServerParams setVar dynamic," << argname << " : " << value;
+  }
+  return iter->second->setVar(value, startup);
+}
 
 bool ServerParams::registerOnupdate(const string& name, funptr ptr) {
   auto iter = _mapServerParams.find(toLower(name));
@@ -516,6 +721,11 @@ bool ServerParams::registerOnupdate(const string& name, funptr ptr) {
 string ServerParams::showAll() const {
   string ret;
   for (auto iter : _mapServerParams) {
+    if (iter.second->getName() == "requirepass" ||
+        iter.second->getName() == "masterauth") {
+      ret += "  " + iter.second->getName() + ":******\n";
+      continue;
+    }
     ret += "  " + iter.second->getName() + ":" + iter.second->show() + "\n";
   }
 

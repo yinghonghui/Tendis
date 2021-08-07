@@ -1,4 +1,4 @@
-#!/bin/sh
+#!/bin/bash
 
 sh ./unittest.sh >&unittest.log &
 
@@ -12,7 +12,7 @@ cd src/tendisplus/integrate_test
 ./gotest.sh &
 cd -
 
-grep -En "\[err|\[exception" redistest.log
+grep -En "\[err|\[exception|49merr|49mexception" redistest.log
 :<<!
 grep PASSED repl_test.log
 grep PASSED restore_test.log

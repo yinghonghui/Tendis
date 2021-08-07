@@ -27,7 +27,8 @@ namespace tendisplus {
 using namespace std;  // NOLINT
 
 using funptr = std::function<void()>;
-using checkfunptr = std::function<bool(const string&)>;
+using checkfunptr = std::function<bool(
+        const string&, bool startup, string* errinfo)>;
 using preProcess = std::function<string(const string&)>;
 
 string removeQuotes(const string& v);
@@ -49,14 +50,11 @@ class BaseVar {
     }
   }
   virtual ~BaseVar() {}
-  bool setVar(const string& value, string* errinfo = NULL, bool force = true) {
-    if (!allowDynamicSet && !force) {
-      if (errinfo != NULL) {
-        *errinfo = "not allow dynamic set";
-      }
-      return false;
+  Status setVar(const string& value, bool startup = true) {
+    if (!allowDynamicSet && !startup) {
+      return {ErrorCodes::ERR_PARSEOPT, name + "can't change dynamically"};
     }
-    return set(value);
+    return set(value, startup);
   }
   virtual string show() const = 0;
   virtual string default_show() const = 0;
@@ -73,10 +71,11 @@ class BaseVar {
   }
 
  protected:
-  virtual bool set(const string& value) = 0;
-  virtual bool check(const string& value) {
+  virtual Status set(const string& value, bool startup) = 0;
+  virtual bool check(
+          const string& value, bool startup, string* errinfo = NULL) {
     if (checkFun != NULL) {
-      return checkFun(value);
+      return checkFun(value, startup, errinfo);
     }
     return true;
   }
@@ -112,16 +111,18 @@ class StringVar : public BaseVar {
   }
 
  private:
-  bool set(const string& val) {
+  Status set(const string& val, bool startup) {
     auto v = preProcessFun ? preProcessFun(val) : val;
-    if (!check(v))
-      return false;
+    std::string errinfo;
+    if (!check(v, startup, &errinfo)) {
+      return {ErrorCodes::ERR_PARSEOPT, errinfo};
+    }
 
     *reinterpret_cast<string*>(value) = v;
 
     if (Onupdate != NULL)
       Onupdate();
-    return true;
+    return {ErrorCodes::ERR_OK, ""};
   }
   std::string _defaultValue;
 };
@@ -148,26 +149,27 @@ class IntVar : public BaseVar {
   }
 
  private:
-  bool set(const string& val) {
+  Status set(const string& val, bool startup) {
     auto v = preProcessFun ? preProcessFun(val) : val;
-    if (!check(v))
-      return false;
-    int64_t valTemp;
-
-    try {
-      valTemp = std::stoi(v);
-    } catch (...) {
-      LOG(ERROR) << "IntVar stoi err:" << v;
-      return false;
+    std::string errinfo;
+    if (!check(v, startup, &errinfo)) {
+      return {ErrorCodes::ERR_PARSEOPT, errinfo};
     }
+
+    auto eInt = tendisplus::stoll(v);
+    if (!eInt.ok()) {
+      return eInt.status();
+    }
+    int64_t valTemp = eInt.value();
     if (valTemp < _minVal || valTemp > _maxVal) {
-      return false;
+      return {ErrorCodes::ERR_PARSEOPT, name + " is out of range"};
     }
     *reinterpret_cast<int*>(value) = valTemp;
 
     if (Onupdate != NULL)
       Onupdate();
-    return true;
+
+    return {ErrorCodes::ERR_OK, ""};
   }
   int _defaultValue;
   int64_t _minVal;
@@ -196,26 +198,27 @@ class Int64Var : public BaseVar {
   }
 
  private:
-  bool set(const string& val) {
+  Status set(const string& val, bool startup) {
     auto v = preProcessFun ? preProcessFun(val) : val;
-    if (!check(v))
-      return false;
-    int64_t valTemp;
-
-    try {
-      valTemp = std::stoll(v);
-    } catch (...) {
-      LOG(ERROR) << "Int64Var stoll err:" << v;
-      return false;
+    std::string errinfo;
+    if (!check(v, startup, &errinfo)) {
+      return {ErrorCodes::ERR_PARSEOPT, errinfo};
     }
+
+    auto eInt = tendisplus::stoll(v);
+    if (!eInt.ok()) {
+      return eInt.status();
+    }
+    int64_t valTemp = eInt.value();
     if (valTemp < _minVal || valTemp > _maxVal) {
-      return false;
+      return {ErrorCodes::ERR_PARSEOPT, name + " is out of range"};
     }
     *reinterpret_cast<int64_t*>(value) = valTemp;
 
     if (Onupdate != NULL)
       Onupdate();
-    return true;
+
+    return {ErrorCodes::ERR_OK, ""};
   }
   int64_t _defaultValue;
   int64_t _minVal;
@@ -239,20 +242,22 @@ class FloatVar : public BaseVar {
   }
 
  private:
-  bool set(const string& val) {
+  Status set(const string& val, bool startup) {
     auto v = preProcessFun ? preProcessFun(val) : val;
-    if (!check(v))
-      return false;
-
-    try {
-      *reinterpret_cast<float*>(value) = std::stof(v);
-    } catch (...) {
-      LOG(ERROR) << "FloatVar stof err:" << v;
-      return false;
+    std::string errinfo;
+    if (!check(v, startup, &errinfo)) {
+      return {ErrorCodes::ERR_PARSEOPT, errinfo};
     }
+
+    auto eFloat = tendisplus::stold(v);
+    if (!eFloat.ok()) {
+      return eFloat.status();
+    }
+    *reinterpret_cast<float*>(value) = static_cast<float>(eFloat.value());
+
     if (Onupdate != NULL)
       Onupdate();
-    return true;
+    return {ErrorCodes::ERR_OK, ""};
   }
   float _defaultValue;
 };
@@ -274,16 +279,18 @@ class BoolVar : public BaseVar {
   }
 
  private:
-  bool set(const string& val) {
+  Status set(const string& val, bool startup) {
     auto v = preProcessFun ? preProcessFun(val) : val;
-    if (!check(v))
-      return false;
+    std::string errinfo;
+    if (!check(v, startup, &errinfo)) {
+      return {ErrorCodes::ERR_PARSEOPT, errinfo};
+    }
 
     *reinterpret_cast<bool*>(value) = isOptionOn(v);
 
     if (Onupdate != NULL)
       Onupdate();
-    return true;
+    return {ErrorCodes::ERR_OK, ""};
   }
   bool _defaultValue;
 };
@@ -323,10 +330,7 @@ class ServerParams {
   string showAll() const;
   bool showVar(const string& key, string* info) const;
   bool showVar(const string& key, vector<string>* info) const;
-  bool setVar(const string& name,
-              const string& value,
-              string* errinfo,
-              bool force = true);
+  Status setVar(const string& name, const string& value, bool startup = true);
   Status rewriteConfig() const;
   uint32_t paramsNum() const {
     return _mapServerParams.size();
@@ -342,6 +346,9 @@ class ServerParams {
   }
 
  private:
+  Status checkParams();
+
+ private:
   map<string, BaseVar*> _mapServerParams;
   std::unordered_map<string, int64_t> _rocksdbOptions;
   std::string _confFile = "";
@@ -352,6 +359,7 @@ class ServerParams {
   uint32_t port = 8903;
   std::string logLevel = "";
   std::string logDir = "./";
+  bool daemon = true;
 
   std::string storageEngine = "rocks";
   std::string dbPath = "./db";
@@ -367,6 +375,8 @@ class ServerParams {
   bool checkKeyTypeForSet = false;
 
   uint32_t chunkSize = 0x4000;  // same as rediscluster
+  // forward compatible only
+  uint32_t fakeChunkSize = 0x4000;
   uint32_t kvStoreCount = 10;
 
   uint32_t scanCntIndexMgr = 1000;
@@ -411,9 +421,15 @@ class ServerParams {
 
   uint32_t keysDefaultLimit = 100;
   uint32_t lockWaitTimeOut = 3600;
+  uint32_t lockDbXWaitTimeout = 1;
+
+  // parameter for scan command
+  uint32_t scanDefaultLimit = 10;
+  uint32_t scanDefaultMaxIterateTimes = 10000;
 
   // parameter for rocksdb
   uint32_t rocksBlockcacheMB = 4096;
+  int32_t rocksBlockcacheNumShardBits = 6;
   bool rocksStrictCapacityLimit = false;
   std::string rocksWALDir = "";
   string rocksCompressType = "snappy";
@@ -423,30 +439,42 @@ class ServerParams {
   bool level0Compress = false;
   bool level1Compress = false;
 
-  uint32_t bingLogSendBatch = 256;
-  uint32_t bingLogSendBytes = 16 * 1024 * 1024;
+  uint32_t binlogSendBatch = 256;
+  uint32_t binlogSendBytes = 16 * 1024 * 1024;
 
   uint32_t migrateSenderThreadnum = 4;
   uint32_t migrateReceiveThreadnum = 4;
   uint32_t garbageDeleteThreadnum = 1;
-  uint16_t garbageDeleteSize = 30;
+  uint32_t garbageDeleteSize = 30;
 
   bool clusterEnabled = false;
   bool domainEnabled = false;
   bool slaveMigarateEnabled = false;
-  bool enableGcInMigate = true;
+  bool enableGcInMigate = false;
+  bool aofEnabled = false;
+  bool psyncEnabled = false;
+  uint32_t forceRecovery = 0;
 
+  uint32_t aofPsyncNum = 500;
   uint32_t snapShotRetryCnt = 1000;
   uint32_t migrateTaskSlotsLimit = 10;
   uint32_t migrateDistance = 10000;
-  uint16_t migrateBinlogIter = 10;
+  uint32_t migrateBinlogIter = 10;
   uint32_t migrateRateLimitMB = 32;
+  uint32_t migrateSnapshotKeyNum = 100000;
   uint32_t clusterNodeTimeout = 15000;
   bool clusterRequireFullCoverage = true;
   bool clusterSlaveNoFailover = false;
   uint32_t clusterMigrationBarrier = 1;
   uint32_t clusterSlaveValidityFactor = 10;
   bool clusterSingleNode = false;
+
+  int64_t luaTimeLimit = 5000;  // ms
+  int64_t luaStateMaxIdleTime = 60*60*1000;  // ms
+  bool jeprofAutoDump = true;
+  bool compactRangeAfterDeleteRange = false;
+  bool saveMinBinlogId = true;
+  bool deleteFilesInRangeforBinlog = false;
 };
 
 extern std::shared_ptr<tendisplus::ServerParams> gParams;

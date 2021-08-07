@@ -320,17 +320,6 @@ func checkSortedData2(m *[]util.RedisServer, num int, prefixkey string) {
     log.Infof("checkData end(Zadd). prefixkey:%s", prefixkey)
 }
 
-var (
-    CLUSTER_SLOTS = 16384
-)
-type NodeInfo struct {
-    index int
-    startSlot int
-    endSlot int
-    migrateStartSlot int
-    migrateEndSlot int
-}
-
 func checkSlots(servers *[]util.RedisServer, serverIdx int, nodeInfoArray *[]NodeInfo,
     clusterNodeNum int, dstNodeIndex int, checkself bool) {
     log.Infof("checkSlots begin idx:%d checkself:%v", serverIdx, checkself)
@@ -491,6 +480,7 @@ func testCluster(clusterIp string, clusterPortStart int, clusterNodeNum int) {
         cfgArgs["masterauth"] = "tendis+test"
         cfgArgs["generalLog"] = "true"
         cfgArgs["cluster-migration-slots-num-per-task"] = "10000"
+        cfgArgs["migrate-gc-enabled"] = "true"
         if err := server.Setup(false, &cfgArgs); err != nil {
             log.Fatalf("setup failed,port:%s err:%v", port, err)
         }
@@ -643,8 +633,8 @@ func testCluster(clusterIp string, clusterPortStart int, clusterNodeNum int) {
     checkSlots(&servers, dstNodeIndex, &nodeInfoArray, clusterNodeNum, dstNodeIndex, checkself)
     // dst node slave
     checkSlots(&servers, dstNodeIndex + 1, &nodeInfoArray, clusterNodeNum, dstNodeIndex, checkself)
-
-    // check keys num
+	
+     // check keys num
     masterTotalKeyNum := 0
     slaveTotalKeyNum := 0
     var nodesKeyNum []int
@@ -660,6 +650,7 @@ func testCluster(clusterIp string, clusterPortStart int, clusterNodeNum int) {
             masterIndex = dstNodeIndex
         }
         cli := createClient(&servers[i])
+
         nodeKeyNum := 0
         for j := 0; j < CLUSTER_SLOTS; j++ {
             r, err := cli.Cmd("cluster", "countkeysinslot", j).Int();

@@ -18,6 +18,7 @@
 #include "tendisplus/utils/status.h"
 #include "tendisplus/utils/time.h"
 #include "tendisplus/utils/atomic_utility.h"
+#include "tendisplus/utils/invariant.h"
 
 namespace tendisplus {
 
@@ -35,6 +36,7 @@ class PoolMatrix {
   Atom<uint64_t> queueTime{0};
   Atom<uint64_t> executeTime{0};
   std::string toString() const;
+  std::string getInfoString() const;
   void reset();
 };
 
@@ -56,7 +58,16 @@ class WorkerPool {
       int64_t outQueueTs = nsSinceEpoch();
       _matrix->queueTime += outQueueTs - enQueueTs;
       ++_matrix->executing;
-      mytask();
+      try {
+        mytask();
+      } catch (const IOCtxException& ex) {
+        LOG(INFO) << "catch IOCtxException,"
+          << _name << ":" << std::this_thread::get_id();
+        throw ex;
+      } catch (const std::exception& ex) {
+        LOG(ERROR) << "schedule task error:" << ex.what();
+        INVARIANT_D(0);
+      }
       --_matrix->inQueue;
       --_matrix->executing;
       int64_t endExeTs = nsSinceEpoch();

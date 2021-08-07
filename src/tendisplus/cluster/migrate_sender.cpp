@@ -124,7 +124,7 @@ Status ChunkMigrateSender::sendChunk() {
       LOG(ERROR) << "set myself meta data fail on slots:" << s.toString();
       return s;
     }
-    _clusterState->clusterSaveNodes();
+    _clusterState->setTodoFlag(CLUSTER_TODO_FLAG_SAVE);
   }
   /* unlock after receive package */
   unlockChunks();
@@ -163,7 +163,7 @@ void ChunkMigrateSender::setSenderStatus(MigrateSenderStatus s) {
 
 // check if bitmap all belong to dst node
 bool ChunkMigrateSender::checkSlotsBlongDst() {
-  std::lock_guard<std::mutex> lk(_mutex);
+  std::lock_guard<myMutex> lk(_mutex);
   for (size_t id = 0; id < _slots.size(); id++) {
     if (_slots.test(id)) {
       if (_clusterState->getNodeBySlot(id) != _dstNode) {
@@ -175,7 +175,7 @@ bool ChunkMigrateSender::checkSlotsBlongDst() {
 }
 
 int64_t ChunkMigrateSender::getBinlogDelay() const {
-  std::lock_guard<std::mutex> lk(_mutex);
+  std::lock_guard<myMutex> lk(_mutex);
   if (_binlogTimeStamp != 0) {
     return msSinceEpoch() - _binlogTimeStamp;
   }
@@ -194,7 +194,8 @@ Expected<std::unique_ptr<Transaction>> ChunkMigrateSender::initTxn() {
 
 Expected<uint64_t> ChunkMigrateSender::sendRange(Transaction* txn,
                                                  uint32_t begin,
-                                                 uint32_t end) {
+                                                 uint32_t end,
+                                                 uint32_t* totalNum) {
   // need add IS lock for chunks ???
   auto cursor = std::move(txn->createSlotsCursor(begin, end));
   uint32_t totalWriteNum = 0;
@@ -202,6 +203,7 @@ Expected<uint64_t> ChunkMigrateSender::sendRange(Transaction* txn,
   uint32_t curWriteNum = 0;
   uint32_t timeoutSec = 5;
   Status s;
+  uint64_t sendKeyNum = _cfg->migrateSnapshotKeyNum;
   while (true) {
     Expected<Record> expRcd = cursor->next();
     if (expRcd.status().code() == ErrorCodes::ERR_EXHAUST) {
@@ -236,17 +238,17 @@ Expected<uint64_t> ChunkMigrateSender::sendRange(Transaction* txn,
     SyncWriteData(value);
 
     curWriteNum++;
-    totalWriteNum++;
+    *totalNum += 1;
     uint64_t sendBytes =
       1 + sizeof(uint32_t) + keylen + sizeof(uint32_t) + valuelen;
-    curWriteNum += sendBytes;
+    curWriteLen += sendBytes;
 
     /* *
      * rate limit for migration
      */
     _svr->getMigrateManager()->requestRateLimit(sendBytes);
 
-    if (curWriteNum >= 10000 || curWriteLen > 10 * 1024 * 1024) {
+    if (curWriteNum >= sendKeyNum || curWriteLen > 10 * 1024 * 1024) {
       SyncWriteData("1");
       SyncReadData(exptData, _OKSTR.length(), timeoutSec);
       if (exptData.value() != _OKSTR) {
@@ -300,12 +302,14 @@ Status ChunkMigrateSender::sendSnapshot() {
   for (size_t i = 0; i < CLUSTER_SLOTS; i++) {
     if (_slots.test(i)) {
       sendSlotNum++;
-      auto ret = sendRange(eTxn.value().get(), i, i + 1);
+      uint32_t sendNum = 0;
+      auto ret = sendRange(eTxn.value().get(), i, i + 1, &sendNum);
+      _snapshotKeyNum.fetch_add(sendNum, std::memory_order_relaxed);
       if (!ret.ok()) {
-        LOG(ERROR) << "sendRange failed, slot:" << i << "-" << i + 1;
+        LOG(ERROR) << "sendRange failed, slot:" << i
+                   << "send keys num:" << getSnapshotNum();
         return ret.status();
       }
-      _snapshotKeyNum.fetch_add(ret.value(), std::memory_order_relaxed);
     }
   }
   SyncWriteData("3");  // send over of all
@@ -319,26 +323,11 @@ Status ChunkMigrateSender::sendSnapshot() {
             << " sendSlotNum:" << sendSlotNum
             << " totalWriteNum:" << getSnapshotNum()
             << " useTime:" << endTime - startTime
-            << " slots:" << bitsetStrEncode(_slots);
+            << " slots:" << bitsetStrEncode(_slots) << " taskid:" << _taskid;
   return {ErrorCodes::ERR_OK, ""};
 }
 
-uint64_t ChunkMigrateSender::getMaxBinLog(Transaction* ptxn) const {
-  uint64_t maxBinlogId = 0;
-  auto expBinlogidMax = RepllogCursorV2::getMaxBinlogId(ptxn);
-  if (!expBinlogidMax.ok()) {
-    if (expBinlogidMax.status().code() != ErrorCodes::ERR_EXHAUST) {
-      LOG(ERROR) << "slave offset getMaxBinlogId error:"
-                 << expBinlogidMax.status().toString();
-    }
-  } else {
-    maxBinlogId = expBinlogidMax.value();
-  }
-  return maxBinlogId;
-}
-
 Status ChunkMigrateSender::resetClient() {
-  std::lock_guard<std::mutex> lk(_mutex);
   setClient(nullptr);
   std::shared_ptr<BlockingTcpClient> client =
     std::move(_svr->getNetwork()->createBlockingClient(64 * 1024 * 1024));
@@ -387,7 +376,7 @@ Status ChunkMigrateSender::catchupBinlog(uint64_t end) {
     /* NOTE(wayenchen) may have already sended half binlog but fail,
         so update the _curbinlog first*/
     {
-      std::lock_guard<std::mutex> lk(_mutex);
+      std::lock_guard<myMutex> lk(_mutex);
       _binlogNum.fetch_add(binlogNum, std::memory_order_relaxed);
       if (newBinlogId != 0) {
         _curBinlogid.store(newBinlogId, std::memory_order_relaxed);
@@ -400,7 +389,7 @@ Status ChunkMigrateSender::catchupBinlog(uint64_t end) {
     }
 
     {
-      std::lock_guard<std::mutex> lk(_mutex);
+      std::lock_guard<myMutex> lk(_mutex);
       if (!s.ok() && needRetry) {
         if (newBinlogId > 0) {
           _curBinlogid.store(newBinlogId, std::memory_order_relaxed);
@@ -518,7 +507,8 @@ Status ChunkMigrateSender::sendLastBinlog() {
                << "on slots:" << bitsetStrEncode(_slots);
     return ptxn.status();
   }
-  auto maxBinlogId = getMaxBinLog(ptxn.value().get());
+  auto maxBinlogId = kvstore->getNextBinlogSeq();
+
   auto s = catchupBinlog(maxBinlogId);
   if (!s.ok()) {
     return s;
@@ -708,7 +698,7 @@ Status ChunkMigrateSender::lockChunks() {
 }
 
 void ChunkMigrateSender::unlockChunks() {
-  std::lock_guard<std::mutex> lk(_mutex);
+  std::lock_guard<myMutex> lk(_mutex);
   _slotsLockList.clear();
   _lockEndTime.store(msSinceEpoch(), std::memory_order_relaxed);
 }
@@ -737,7 +727,7 @@ bool ChunkMigrateSender::needToSendFail() const {
 
 
 void ChunkMigrateSender::setStartTime(const std::string& str) {
-  std::lock_guard<std::mutex> lk(_mutex);
+  std::lock_guard<myMutex> lk(_mutex);
   _startTime = str;
 }
 

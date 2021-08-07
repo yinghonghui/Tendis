@@ -64,29 +64,6 @@ class Cursor {
   virtual Status prev() = 0;
   virtual Expected<std::string> key() = 0;
 };
-class RepllogCursorV2 {
- public:
-  RepllogCursorV2() = delete;
-  // NOTE(vinchen): in range of [begin, end], be careful both close interval
-  RepllogCursorV2(Transaction* txn, uint64_t begin, uint64_t end);
-  ~RepllogCursorV2() = default;
-  Expected<ReplLogRawV2> next();
-  Expected<ReplLogV2> nextV2();
-  Status seekToLast();
-  static Expected<uint64_t> getMinBinlogId(Transaction* txn);
-  static Expected<uint64_t> getMaxBinlogId(Transaction* txn);
-  static Expected<ReplLogRawV2> getMinBinlog(Transaction* txn);
-  static Expected<ReplLogRawV2> getMaxBinlog(Transaction* txn);
-
- protected:
-  Transaction* _txn;
-  std::unique_ptr<Cursor> _baseCursor;
-
- private:
-  uint64_t _start;
-  uint64_t _cur;
-  const uint64_t _end;
-};
 
 class BasicDataCursor {
  public:
@@ -101,6 +78,7 @@ class BasicDataCursor {
 
  protected:
   std::unique_ptr<Cursor> _baseCursor;
+  bool _seeked;
 };
 
 class AllDataCursor {
@@ -116,6 +94,7 @@ class AllDataCursor {
 
  protected:
   std::unique_ptr<Cursor> _baseCursor;
+  bool _seeked;
 };
 
 class BinlogCursor {
@@ -131,6 +110,7 @@ class BinlogCursor {
 
  protected:
   std::unique_ptr<Cursor> _baseCursor;
+  bool _seeked;
 };
 
 class TTLIndexCursor {
@@ -165,6 +145,7 @@ class VersionMetaCursor {
   std::unique_ptr<Cursor> _baseCursor;
 };
 
+// only RecordType::RT_DATA_META
 class SlotCursor {
  public:
   SlotCursor() = delete;
@@ -194,6 +175,38 @@ class SlotsCursor {
   std::unique_ptr<Cursor> _baseCursor;
 };
 
+struct MinbinlogInfo {
+  uint64_t id;
+  uint64_t ts;
+};
+
+class RepllogCursorV2 {
+ public:
+  RepllogCursorV2() = delete;
+  // NOTE(vinchen): in range of [begin, end], be careful both close interval
+  RepllogCursorV2(Transaction* txn, uint64_t begin, uint64_t end);
+  ~RepllogCursorV2() = default;
+  Expected<ReplLogRawV2> next();
+  Expected<ReplLogV2> nextV2();
+  Status seekToLast();
+  static Expected<uint64_t> getMinBinlogId(Transaction* txn);
+  static Expected<uint64_t> getMaxBinlogId(Transaction* txn);
+  static Expected<struct MinbinlogInfo> getMinBinlogMeta(Transaction* txn,
+          bool checkTs);
+  static Expected<struct MinbinlogInfo> getMinBinlogByCursor(Transaction* txn);
+  static Expected<struct MinbinlogInfo> getMinBinlog(Transaction* txn);
+  static Expected<ReplLogRawV2> getMaxBinlog(Transaction* txn);
+
+ protected:
+  Transaction* _txn;
+  std::unique_ptr<BinlogCursor> _baseCursor;
+
+ private:
+  uint64_t _start;
+  uint64_t _cur;
+  const uint64_t _end;
+};
+
 class Transaction {
  public:
   Transaction() = default;
@@ -202,8 +215,6 @@ class Transaction {
   virtual ~Transaction() = default;
   virtual Expected<uint64_t> commit() = 0;
   virtual Status rollback() = 0;
-  virtual std::unique_ptr<Cursor> createCursor(
-    ColumnFamilyNumber cf, const std::string* iterate_upper_bound = NULL) = 0;
   virtual Status flushall() = 0;
   virtual Status migrate(const std::string& logKey,
                          const std::string& logValue) = 0;
@@ -239,12 +250,20 @@ class Transaction {
                        const std::string& val,
                        const uint64_t ts = 0) = 0;
   virtual Status delKV(const std::string& key, const uint64_t ts = 0) = 0;
+  virtual Status setKVWithoutBinlog(const std::string& key,
+                       const std::string& val) = 0;
   virtual Status addDeleteRangeBinlog(const std::string& begin,
                                       const std::string& end) = 0;
   virtual uint64_t getBinlogTime() = 0;
   virtual void setBinlogTime(uint64_t timestamp) = 0;
   virtual bool isReplOnly() const = 0;
   virtual uint64_t getTxnId() const = 0;
+
+ protected:
+  virtual std::unique_ptr<Cursor> createCursor(ColumnFamilyNumber cf,
+          const std::string* iterate_upper_bound = NULL) = 0;
+
+ public:
   static constexpr uint64_t MAX_VALID_TXNID =
     std::numeric_limits<uint64_t>::max() / 2;
   static constexpr uint64_t MIN_VALID_TXNID = 1;
@@ -293,6 +312,12 @@ class BinlogObserver {
 };
 
 struct KVStoreStat {
+  KVStoreStat()
+    : compactFilterCount(0),
+      compactKvExpiredCount(0),
+      pausedErrorCount(0),
+      destroyedErrorCount(0) {}
+
   std::atomic<uint64_t> compactFilterCount;
   std::atomic<uint64_t> compactKvExpiredCount;
   // number of request when store is paused
@@ -306,14 +331,14 @@ struct KVStoreStat {
 
 struct TruncateBinlogResult {
   TruncateBinlogResult()
-    : newStart(0), newSave(0), timestamp(0), written(0), deleten(0), ret(0) {}
+    : newStart(0), newSave(0), timestamp(0), written(0), deleten(0), err(0) {}
 
   uint64_t newStart;
   uint64_t newSave;
   uint64_t timestamp;
   uint64_t written;
   uint64_t deleten;
-  int32_t ret;
+  int32_t err;
 };
 
 class KVStore {
@@ -385,18 +410,22 @@ class KVStore {
   virtual Status pause() = 0;
   virtual Status resume() = 0;
   virtual Status destroy() = 0;
-  virtual bool getIntProperty(const std::string& property,
-                              uint64_t* value) const = 0;
-  virtual bool getProperty(const std::string& property,
-                           std::string* value) const = 0;
+  virtual bool getIntProperty(const std::string& property, uint64_t* value,
+    ColumnFamilyNumber cf = ColumnFamilyNumber::ColumnFamily_Default) const = 0;
+  virtual bool getProperty(const std::string& property, std::string* value,
+    ColumnFamilyNumber cf = ColumnFamilyNumber::ColumnFamily_Default) const = 0;
   virtual std::string getAllProperty() const = 0;
   virtual std::string getStatistics() const = 0;
+  virtual uint64_t getStatCountById(uint32_t id) const = 0;
+  virtual uint64_t getStatCountByName(const std::string& name) const = 0;
   virtual std::string getBgError() const = 0;
   virtual Status recoveryFromBgError() = 0;
   virtual void resetStatistics() = 0;
 
   virtual Expected<VersionMeta> getVersionMeta() = 0;
   virtual Expected<VersionMeta> getVersionMeta(const std::string& name) = 0;
+  virtual Expected<std::vector<VersionMeta>>
+          getAllVersionMeta(Transaction *txn) = 0;
   virtual Status setVersionMeta(const std::string& name,
                                 uint64_t ts,
                                 uint64_t version) = 0;
@@ -428,6 +457,8 @@ class KVStore {
   uint64_t getBinlogTime();
   void setBinlogTime(uint64_t timestamp);
   uint64_t getCurrentTime();
+  virtual Status setOption(const std::string& option, int64_t value) = 0;
+  virtual int64_t getOption(const std::string& option) = 0;
 
   KVStoreStat stat;
 

@@ -157,6 +157,7 @@ std::shared_ptr<ServerParams> genParams() {
   auto cfg = std::make_shared<ServerParams>();
   auto s = cfg->parseFile("a.cfg");
   EXPECT_EQ(s.ok(), true) << s.toString();
+  gParams = cfg;
   return cfg;
 }
 
@@ -203,8 +204,12 @@ void testMaxBinlogId(const std::unique_ptr<RocksKVStore>& kvstore) {
 TEST(RocksKVStore, RocksOptions) {
   auto cfg = genParamsRocks();
 
-  EXPECT_TRUE(filesystem::create_directory("db"));
-  EXPECT_TRUE(filesystem::create_directory("log"));
+  if (!filesystem::exists("db")) {
+    EXPECT_TRUE(filesystem::create_directory("db"));
+  }
+  if (!filesystem::exists("log")) {
+    EXPECT_TRUE(filesystem::create_directory("log"));
+  }
   const auto guard = MakeGuard([] {
     filesystem::remove_all("./log");
     filesystem::remove_all("./db");
@@ -224,13 +229,19 @@ TEST(RocksKVStore, RocksOptions) {
   }
   EXPECT_EQ(kvstore->getUnderlayerPesDB()->GetOptions().create_if_missing,
             true);
-
+#if ROCKSDB_MAJOR == 6 && ROCKSDB_MINOR > 13
+  rocksdb::BlockBasedTableOptions* option =
+    (rocksdb::BlockBasedTableOptions*)kvstore->getUnderlayerPesDB()
+      ->GetOptions()
+      .table_factory->GetOptions<rocksdb::BlockBasedTableOptions>();
+  EXPECT_EQ(option->cache_index_and_filter_blocks, true);
+#else
   rocksdb::BlockBasedTableOptions* option =
     (rocksdb::BlockBasedTableOptions*)kvstore->getUnderlayerPesDB()
       ->GetOptions()
       .table_factory->GetOptions();
   EXPECT_EQ(option->cache_index_and_filter_blocks, true);
-
+#endif
   LocalSessionGuard sg(nullptr);
   uint64_t ts = genRand();
   uint64_t versionep = genRand();
@@ -273,13 +284,19 @@ TEST(RocksKVStore, BinlogRightMost) {
             2);
   EXPECT_EQ(kvstore->getUnderlayerPesDB()->GetOptions().create_if_missing,
             true);
-
+#if ROCKSDB_MAJOR == 6 && ROCKSDB_MINOR > 13
+  rocksdb::BlockBasedTableOptions* option =
+    (rocksdb::BlockBasedTableOptions*)kvstore->getUnderlayerPesDB()
+      ->GetOptions()
+      .table_factory->GetOptions<rocksdb::BlockBasedTableOptions>();
+  EXPECT_EQ(option->cache_index_and_filter_blocks, false);
+#else
   rocksdb::BlockBasedTableOptions* option =
     (rocksdb::BlockBasedTableOptions*)kvstore->getUnderlayerPesDB()
       ->GetOptions()
       .table_factory->GetOptions();
   EXPECT_EQ(option->cache_index_and_filter_blocks, false);
-
+#endif
   LocalSessionGuard sg(nullptr);
   uint64_t ts = genRand();
   uint64_t versionep = genRand();
@@ -329,8 +346,7 @@ TEST(RocksKVStore, BinlogRightMost) {
 
     auto expMinB = RepllogCursorV2::getMinBinlog(txn2.get());
     EXPECT_TRUE(expMinB.ok());
-    EXPECT_EQ(expMinB.value().getBinlogId(), 1);
-    EXPECT_EQ(expMinB.value().getVersionEp(), versionep);
+    EXPECT_EQ(expMinB.value().id, 1);
   }
   auto bcursor = txn2->createRepllogCursorV2(Transaction::MIN_VALID_TXNID);
   auto ss = bcursor->seekToLast();
@@ -610,11 +626,10 @@ TEST(RocksKVStore, CursorUpperBound) {
   std::unique_ptr<Transaction> txn2 = std::move(eTxn2.value());
   RecordKey upper(1, 0, RecordType::RT_INVALID, "", "");
   string upperBound = upper.prefixChunkid();
-  std::unique_ptr<Cursor> cursor =
-    txn2->createCursor(ColumnFamilyNumber::ColumnFamily_Default, &upperBound);
+  // NOTE(takenliu) RocksTxn::createCursor not be public anymore
+  std::unique_ptr<SlotCursor> cursor =
+    txn2->createSlotCursor(0);
 
-  RecordKey start(0, 0, RecordType::RT_INVALID, "", "");
-  cursor->seek(start.prefixChunkid());
   int32_t cnt = 0;
   while (true) {
     Expected<Record> v = cursor->next();
@@ -626,8 +641,7 @@ TEST(RocksKVStore, CursorUpperBound) {
   }
   EXPECT_EQ(cnt, 30000);
 
-  RecordKey start2(0, 0, RecordType::RT_KV, "b", "");
-  cursor->seek(start2.encode());
+  cursor = txn2->createSlotCursor(1);
   cnt = 0;
   while (true) {
     Expected<Record> v = cursor->next();
@@ -637,7 +651,7 @@ TEST(RocksKVStore, CursorUpperBound) {
     }
     cnt += 1;
   }
-  EXPECT_EQ(cnt, 20000);
+  EXPECT_EQ(cnt, 10000);
 }
 
 TEST(RocksKVStore, BackupCkptInter) {
@@ -894,6 +908,11 @@ void commonRoutine(RocksKVStore* kvstore) {
   EXPECT_EQ(eTxn2.ok(), true);
   std::unique_ptr<Transaction> txn1 = std::move(eTxn1.value());
   std::unique_ptr<Transaction> txn2 = std::move(eTxn2.value());
+
+#ifdef TENDIS_DEBUG
+  // ignore INVARIANT for rocksdb error
+  kvstore->setIgnoreRocksError();
+#endif
 
   std::set<uint64_t> uncommitted = kvstore->getUncommittedTxns();
   EXPECT_NE(uncommitted.find(dynamic_cast<RocksTxn*>(txn1.get())->getTxnId()),
@@ -1285,6 +1304,93 @@ TEST(RocksKVStore, Compaction) {
     EXPECT_EQ(totalFilter, 3000 - kvCount);
   }
   EXPECT_EQ(totalExpired, kvCount2);
+
+  testMaxBinlogId(kvstore);
+}
+
+TEST(RocksKVStore, CompactionWithNoexpire) {
+  auto cfg = genParams();
+  cfg->noexpire = true;
+  EXPECT_TRUE(filesystem::create_directory("db"));
+  // EXPECT_TRUE(filesystem::create_directory("db/0"));
+  EXPECT_TRUE(filesystem::create_directory("log"));
+  const auto guard = MakeGuard([] {
+    filesystem::remove_all("./log");
+    filesystem::remove_all("./db");
+    SyncPoint::GetInstance()->DisableProcessing();
+    SyncPoint::GetInstance()->ClearAllCallBacks();
+  });
+  auto blockCache =
+    rocksdb::NewLRUCache(cfg->rocksBlockcacheMB * 1024 * 1024LL, 4);
+  auto kvstore = std::make_unique<RocksKVStore>("0",
+                                                cfg,
+                                                blockCache,
+                                                true,
+                                                KVStore::StoreMode::READ_WRITE,
+                                                RocksKVStore::TxnMode::TXN_PES);
+
+  SyncPoint::GetInstance()->EnableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+
+  uint64_t totalFilter = 0;
+  SyncPoint::GetInstance()->SetCallBack(
+    "InspectKvTtlFilterCount", [&](void* arg) mutable {
+      uint64_t* tmp = reinterpret_cast<uint64_t*>(arg);
+      totalFilter = *tmp;
+    });
+
+  uint64_t totalExpired = 0;
+  bool hasCalled = false;
+  SyncPoint::GetInstance()->SetCallBack(
+    "InspectKvTtlExpiredCount", [&](void* arg) mutable {
+      hasCalled = true;
+      uint64_t* tmp = reinterpret_cast<uint64_t*>(arg);
+      totalExpired = *tmp;
+    });
+
+  uint32_t waitSec = 10;
+  // if we want to check the totalFilter, all data should be different
+  genData(kvstore.get(), 1000, 0, true);
+  size_t kvCount = genData(kvstore.get(), 1000, msSinceEpoch(), true);
+  size_t kvCount2 =
+    genData(kvstore.get(), 1000, msSinceEpoch() + waitSec * 1000, true);
+
+
+  std::this_thread::sleep_for(std::chrono::seconds(1));
+  // compact data in the default column family
+  auto status = kvstore->compactRange(
+    ColumnFamilyNumber::ColumnFamily_Default, nullptr, nullptr);
+  EXPECT_TRUE(status.ok());
+  EXPECT_FALSE(hasCalled);
+
+  EXPECT_EQ(totalFilter, 0);
+  EXPECT_EQ(totalExpired, 0);
+
+  std::this_thread::sleep_for(std::chrono::seconds(waitSec));
+
+  status = kvstore->compactRange(
+    ColumnFamilyNumber::ColumnFamily_Default, nullptr, nullptr);
+  EXPECT_TRUE(status.ok());
+  EXPECT_FALSE(hasCalled);
+
+  EXPECT_EQ(totalFilter, 0);
+  EXPECT_EQ(totalExpired, 0);
+
+  testMaxBinlogId(kvstore);
+
+  // set noexpire = false, compaction filter will be call
+  cfg->noexpire = false;
+  status = kvstore->compactRange(
+    ColumnFamilyNumber::ColumnFamily_Default, nullptr, nullptr);
+  EXPECT_TRUE(status.ok());
+  EXPECT_TRUE(hasCalled);
+
+  if (cfg->binlogUsingDefaultCF) {
+    EXPECT_EQ(totalFilter, 3000 * 2);
+  } else {
+    EXPECT_EQ(totalFilter, 3000);
+  }
+  EXPECT_EQ(totalExpired, kvCount + kvCount2);
 
   testMaxBinlogId(kvstore);
 }

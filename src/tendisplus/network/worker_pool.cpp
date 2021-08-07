@@ -21,6 +21,14 @@ std::string PoolMatrix::toString() const {
   return ss.str();
 }
 
+std::string PoolMatrix::getInfoString() const {
+  std::stringstream ss;
+  ss << "inQueue " << inQueue << ",executing " << executing
+     << ",executed " << executed << ",queueTime " << queueTime << "ns"
+     << ",executeTime " << executeTime << "ns";
+  return ss.str();
+}
+
 void PoolMatrix::reset() {
   inQueue = 0;
   executed = 0;
@@ -88,8 +96,7 @@ void WorkerPool::consumeTasks(size_t idx) {
   });
 
   while (_isRuning.load(std::memory_order_relaxed)) {
-    LOG(INFO) << "WorkerPool consumeTasks work:" << idx;
-    // TODO(takenliu): use run_for to make threads more adaptive
+    DLOG(INFO) << "WorkerPool consumeTasks work:" << idx;
     asio::io_context::work work(*_ioCtx);
     try {
       _ioCtx->run();
@@ -102,11 +109,11 @@ void WorkerPool::consumeTasks(size_t idx) {
         detachFlag = true;
         return;
       } else {
-        LOG(ERROR) << "This thread isn't in collection";
+        LOG(ERROR) << "This thread isn't in collection," << _name << ":" << id;
       }
-    } catch (...) {
+    } catch (const std::exception& ex) {
+      LOG(ERROR) << "Workerpool:" << pname << " occurs error:" << ex.what();
       INVARIANT_D(0);
-      LOG(ERROR) << "Workerpool: " << pname << " occurs error";
     }
   }
 }
@@ -137,6 +144,7 @@ Status WorkerPool::startup(size_t poolsize) {
     });
     auto tid = thd.get_id();
     _threads.emplace(tid, std::move(thd));
+    LOG(INFO) << "_threads add, " << _name << ":" << tid;
   }
   _idGenerator.store(poolsize, std::memory_order_relaxed);
   return {ErrorCodes::ERR_OK, ""};
@@ -189,6 +197,7 @@ void WorkerPool::resizeIncrease(size_t size) {
     auto tid = thd.get_id();
     _threads.emplace(tid, std::move(thd));
     _idGenerator.fetch_add(1, std::memory_order::memory_order_relaxed);
+    LOG(INFO) << "_threads add, " << _name << ":" << tid;
   }
 }
 

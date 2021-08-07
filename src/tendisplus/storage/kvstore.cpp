@@ -21,7 +21,7 @@ Status RepllogCursorV2::seekToLast() {
             "RepllogCursorV2 error, detailed at the error log"};
   }
   if (!_baseCursor) {
-    _baseCursor = _txn->createCursor(ColumnFamilyNumber::ColumnFamily_Binlog);
+    _baseCursor = std::move(_txn->createBinlogCursor());
   }
 
   // NOTE(vinchen): it works because binlog has a maximum prefix.
@@ -50,7 +50,58 @@ Status RepllogCursorV2::seekToLast() {
   return key.status();
 }
 
-Expected<ReplLogRawV2> RepllogCursorV2::getMinBinlog(Transaction* txn) {
+Expected<MinbinlogInfo> RepllogCursorV2::getMinBinlogMeta(Transaction* txn,
+        bool checkTs = true) {
+  MinbinlogInfo binlogInfo;
+
+  RecordKey key(REPLLOGKEYV2_META_CHUNKID, REPLLOGKEYV2_META_DBID,
+                RecordType::RT_META, "", "");
+  auto eval = txn->getKV(key.encode());
+  if (eval.ok()) {
+    auto v = RecordValue::decode(eval.value());
+    if (!v.ok()) {
+      LOG(ERROR) << "binlog META decode error:" << v.status().toString();
+      return {ErrorCodes::ERR_INTERGER, "binlog META decode error"};
+    }
+    // old version only has binlogid, don't has timestamp,
+    //   we need use cursor.
+    if (v.value().getRecordType() != RecordType::RT_META) {
+      LOG(ERROR) << "get binlog META error, RecordType:"
+                 << static_cast<int>(v.value().getRecordType());
+      return {ErrorCodes::ERR_INTERGER, "get binlog META error"};
+    }
+
+    if (v.value().getValue().size() == sizeof(uint64_t)) {
+      if (checkTs) {
+        LOG(ERROR) << "get binlog META error, size:"
+          << v.value().getValue().size();
+        return {ErrorCodes::ERR_INTERGER, "get binlog META error"};
+      } else {
+        binlogInfo.id = int64Decode(v.value().getValue().c_str());
+        binlogInfo.ts = 0;
+        return binlogInfo;
+      }
+    } else if (v.value().getValue().size() == 2 * sizeof(uint64_t)) {
+      binlogInfo.id = int64Decode(v.value().getValue().c_str());
+      binlogInfo.ts = int64Decode(v.value().getValue().c_str()
+                                  + sizeof(uint64_t));
+      return binlogInfo;
+    } else {
+      LOG(ERROR) << "get binlog META error, size:"
+        << v.value().getValue().size();
+      return {ErrorCodes::ERR_INTERGER, "get binlog META error"};
+    }
+  } else if (!eval.ok() && eval.status().code() != ErrorCodes::ERR_NOTFOUND) {
+    LOG(WARNING) << "get binlog META error:" << eval.status().toString();
+    return eval.status();
+  }
+
+  return {ErrorCodes::ERR_NOTFOUND, "has no binlog META"};
+}
+
+Expected<MinbinlogInfo> RepllogCursorV2::getMinBinlogByCursor(
+        Transaction *txn) {
+  MinbinlogInfo binlogInfo;
   auto cursor = txn->createBinlogCursor();
   if (!cursor) {
     return {ErrorCodes::ERR_INTERNAL, "txn->createBinlogCursor() error"};
@@ -67,32 +118,44 @@ Expected<ReplLogRawV2> RepllogCursorV2::getMinBinlog(Transaction* txn) {
       return {ErrorCodes::ERR_EXHAUST, ""};
   }*/
 
-  // TODO(vinchen): too more copy
-  return ReplLogRawV2(expRcd.value());
-}
-
-Expected<uint64_t> RepllogCursorV2::getMinBinlogId(Transaction* txn) {
-  auto cursor = txn->createBinlogCursor();
-  if (!cursor) {
-    return {ErrorCodes::ERR_INTERNAL, "txn->createBinlogCursor() error"};
-  }
-  cursor->seek(RecordKey::prefixReplLogV2());
-  Expected<Record> expRcd = cursor->next();
-  if (!expRcd.ok()) {
-    return expRcd.status();
-  }
-
-  /*if (expRcd.value().getRecordKey().getRecordType()
-      != RecordType::RT_BINLOG) {
-      return {ErrorCodes::ERR_EXHAUST, ""};
-  }*/
-
   const RecordKey& rk = expRcd.value().getRecordKey();
   auto explk = ReplLogKeyV2::decode(rk);
   if (!explk.ok()) {
     return explk.status();
   }
-  return explk.value().getBinlogId();
+  binlogInfo.id = explk.value().getBinlogId();
+  const RecordValue& rv = expRcd.value().getRecordValue();
+  auto explv = ReplLogValueV2::decode(rv.encode());
+  if (!explv.ok()) {
+    return explv.status();
+  }
+  binlogInfo.ts = explv.value().getTimestamp();
+  return binlogInfo;
+}
+
+Expected<MinbinlogInfo> RepllogCursorV2::getMinBinlog(Transaction* txn) {
+  if (gParams != nullptr && gParams->saveMinBinlogId) {
+    auto binlogInfo = getMinBinlogMeta(txn);
+    if (binlogInfo.ok()) {
+      return binlogInfo;
+    }
+    DLOG(WARNING) << "binlog META is not exists, will use seek.";
+  }
+
+  auto binlogInfo = getMinBinlogByCursor(txn);
+  if (!binlogInfo.ok()) {
+    LOG(WARNING) << "getMinBinlogByCursor failed:"
+      << binlogInfo.status().toString();
+  }
+  return binlogInfo;
+}
+
+Expected<uint64_t> RepllogCursorV2::getMinBinlogId(Transaction* txn) {
+  auto ret = getMinBinlog(txn);
+  if (!ret.ok()) {
+    return ret.status();
+  }
+  return ret.value().id;
 }
 
 Expected<ReplLogRawV2> RepllogCursorV2::getMaxBinlog(Transaction* txn) {
@@ -152,14 +215,18 @@ Expected<ReplLogRawV2> RepllogCursorV2::next() {
             "RepllogCursorV2 error, detailed at the error log"};
   }
 
+  uint64_t num = 0;
   while (_cur <= _end) {
     ReplLogKeyV2 key(_cur);
     auto keyStr = key.encode();
     auto eval = _txn->getKV(keyStr);
     if (eval.status().code() == ErrorCodes::ERR_NOTFOUND) {
-      _cur++;
       DLOG(WARNING) << "binlogid " << _cur << " is not exists";
-
+      _cur++;
+      if (num++ % 1000 == 0) {
+        LOG(WARNING) << "RepllogCursorV2::next ERR_NOTFOUND too much,"
+                     << " num:" << num << " _cur:" << _cur << " _end:" << _end;
+      }
       continue;
     } else if (!eval.ok()) {
       LOG(WARNING) << "get binlogid " << _cur
@@ -167,7 +234,7 @@ Expected<ReplLogRawV2> RepllogCursorV2::next() {
       return eval.status();
     }
 
-    INVARIANT_D(ReplLogValueV2::decode(eval.value()).ok());
+    // INVARIANT_D(ReplLogValueV2::decode(eval.value()).ok());
     _cur++;
     return ReplLogRawV2(keyStr, eval.value());
   }
@@ -181,14 +248,19 @@ Expected<ReplLogV2> RepllogCursorV2::nextV2() {
             "RepllogCursorV2 error, detailed at the error log"};
   }
 
+  uint64_t num = 0;
   while (_cur <= _end) {
     ReplLogKeyV2 key(_cur);
     auto keyStr = key.encode();
     auto eval = _txn->getKV(keyStr);
     if (eval.status().code() == ErrorCodes::ERR_NOTFOUND) {
       _cur++;
-      LOG(WARNING) << "binlogid " << _cur << " is not exists";
+      DLOG(WARNING) << "binlogid " << _cur << " is not exists";
 
+      if (num++ % 1000 == 0) {
+        LOG(WARNING) << "RepllogCursorV2::nextV2 ERR_NOTFOUND too much,"
+                     << " num:" << num << " _cur:" << _cur << " _end:" << _end;
+      }
       continue;
     } else if (!eval.ok()) {
       LOG(WARNING) << "get binlogid " << _cur
@@ -209,12 +281,11 @@ Expected<ReplLogV2> RepllogCursorV2::nextV2() {
 }
 
 BasicDataCursor::BasicDataCursor(std::unique_ptr<Cursor> cursor)
-  : _baseCursor(std::move(cursor)) {
-  _baseCursor->seek("");
-}
+  : _baseCursor(std::move(cursor)), _seeked(false) {}
 
 void BasicDataCursor::seek(const std::string& prefix) {
   _baseCursor->seek(prefix);
+  _seeked = true;
 }
 
 // can't be used currently
@@ -223,6 +294,11 @@ void BasicDataCursor::seek(const std::string& prefix) {
 }*/
 
 Expected<Record> BasicDataCursor::next() {
+  if (!_seeked) {
+    _baseCursor->seek("");
+    _seeked = true;
+  }
+
   auto expRcd = _baseCursor->next();
   if (expRcd.ok()) {
     Record dataRecord(expRcd.value());
@@ -237,10 +313,18 @@ Expected<Record> BasicDataCursor::next() {
 }
 
 Status BasicDataCursor::prev() {
+  if (!_seeked) {
+    _baseCursor->seek("");
+    _seeked = true;
+  }
   return _baseCursor->prev();
 }
 
 Expected<std::string> BasicDataCursor::key() {
+  if (!_seeked) {
+    _baseCursor->seek("");
+    _seeked = true;
+  }
   auto expKey = _baseCursor->key();
   if (expKey.ok()) {
     std::string dataKey = expKey.value();
@@ -255,24 +339,28 @@ Expected<std::string> BasicDataCursor::key() {
 }
 
 AllDataCursor::AllDataCursor(std::unique_ptr<Cursor> cursor)
-  : _baseCursor(std::move(cursor)) {
-  _baseCursor->seek("");
-}
+  : _baseCursor(std::move(cursor)), _seeked(false) {}
 
 void AllDataCursor::seek(const std::string& prefix) {
   _baseCursor->seek(prefix);
+  _seeked = true;
 }
 
 // can't be used if binlogUsingDefaultCF is true
 void AllDataCursor::seekToLast() {
   _baseCursor->seekToLast();
+  _seeked = true;
 }
 
 Expected<Record> AllDataCursor::next() {
+  if (!_seeked) {
+    _baseCursor->seek("");
+    _seeked = true;
+  }
   auto expRcd = _baseCursor->next();
   if (expRcd.ok()) {
     Record dataRecord(expRcd.value());
-    if (dataRecord.getRecordKey().getRecordType() != RecordType::RT_BINLOG) {
+    if (dataRecord.getRecordKey().getChunkId() < REPLLOGKEYV2_META_CHUNKID) {
       return dataRecord;
     } else {
       return {ErrorCodes::ERR_EXHAUST, "no more AllData"};
@@ -283,14 +371,23 @@ Expected<Record> AllDataCursor::next() {
 }
 
 Status AllDataCursor::prev() {
+  if (!_seeked) {
+    _baseCursor->seek("");
+    _seeked = true;
+  }
   return _baseCursor->prev();
 }
 
 Expected<std::string> AllDataCursor::key() {
+  if (!_seeked) {
+    _baseCursor->seek("");
+    _seeked = true;
+  }
+
   auto expKey = _baseCursor->key();
   if (expKey.ok()) {
     std::string dataKey = expKey.value();
-    if (RecordKey::decodeType(dataKey) != RecordType::RT_BINLOG) {
+    if (RecordKey::decodeChunkId(dataKey) < REPLLOGKEYV2_META_CHUNKID) {
       return dataKey;
     } else {
       return {ErrorCodes::ERR_EXHAUST, "no more AllData"};
@@ -301,19 +398,23 @@ Expected<std::string> AllDataCursor::key() {
 }
 
 BinlogCursor::BinlogCursor(std::unique_ptr<Cursor> cursor)
-  : _baseCursor(std::move(cursor)) {
-  _baseCursor->seek(RecordKey::prefixReplLogV2());
-}
+  : _baseCursor(std::move(cursor)), _seeked(false) {}
 
 void BinlogCursor::seek(const std::string& prefix) {
   _baseCursor->seek(prefix);
+  _seeked = true;
 }
 
 void BinlogCursor::seekToLast() {
   _baseCursor->seekToLast();
+  _seeked = true;
 }
 
 Expected<Record> BinlogCursor::next() {
+  if (!_seeked) {
+    _baseCursor->seek(RecordKey::prefixReplLogV2());
+    _seeked = true;
+  }
   auto expRcd = _baseCursor->next();
   if (expRcd.ok()) {
     Record binlogRecord(expRcd.value());
@@ -328,10 +429,18 @@ Expected<Record> BinlogCursor::next() {
 }
 
 Status BinlogCursor::prev() {
+  if (!_seeked) {
+    _baseCursor->seek(RecordKey::prefixReplLogV2());
+    _seeked = true;
+  }
   return _baseCursor->prev();
 }
 
 Expected<std::string> BinlogCursor::key() {
+  if (!_seeked) {
+    _baseCursor->seek(RecordKey::prefixReplLogV2());
+    _seeked = true;
+  }
   auto expKey = _baseCursor->key();
   if (expKey.ok()) {
     std::string binlogKey = expKey.value();
@@ -446,8 +555,8 @@ SlotsCursor::SlotsCursor(std::unique_ptr<Cursor> cursor,
                          uint32_t begin,
                          uint32_t end)
   : _startSlot(begin), _endSlot(end), _baseCursor(std::move(cursor)) {
-  RecordKey tmplRk(begin, 0, RecordType::RT_KV, "", "");
-  auto prefix = tmplRk.prefixSlotType();
+  RecordKey tmplRk(begin, 0, RecordType::RT_DATA_META, "", "");
+  auto prefix = tmplRk.prefixChunkid();
   _baseCursor->seek(prefix);
 }
 

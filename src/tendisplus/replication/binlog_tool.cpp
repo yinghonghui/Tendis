@@ -1,11 +1,10 @@
 // Copyright (C) 2020 THL A29 Limited, a Tencent company.  All rights reserved.
 // Please refer to the license text that comes with this tendis open source
 // project for additional information.
-
 #include <iostream>
 #include <string>
 #include <vector>
-
+#include "tendisplus/commands/command.h"
 #include "tendisplus/utils/param_manager.h"
 #include "tendisplus/utils/base64.h"
 #include "tendisplus/storage/kvstore.h"
@@ -17,7 +16,7 @@ namespace tendisplus {
 // TODO(takenliu) print error to stderr or logfile?
 class BinlogScanner {
  public:
-  enum TOOL_MODE { TEXT_SHOW = 0, BASE64_SHOW, TEXT_SHOW_SCOPE };
+  enum TOOL_MODE { TEXT_SHOW = 0, BASE64_SHOW, TEXT_SHOW_SCOPE, AOF_SHOW };
 
   void init(const tendisplus::ParamManager& pm) {
     _logfile = pm.getString("logfile");
@@ -30,6 +29,8 @@ class BinlogScanner {
       _mode = TOOL_MODE::BASE64_SHOW;
     } else if (pm.getString("mode") == "scope") {
       _mode = TOOL_MODE::TEXT_SHOW_SCOPE;
+    } else if (pm.getString("mode") == "aof") {
+      _mode = TOOL_MODE ::AOF_SHOW;
     }
   }
 
@@ -93,16 +94,32 @@ class BinlogScanner {
         }
         offset += size;
 
-        Expected<RecordKey> opkey = RecordKey::decode(entry.value().getOpKey());
-        Expected<RecordValue> opvalue =
-          RecordValue::decode(entry.value().getOpValue());
-        if (!opkey.ok() || !opvalue.ok()) {
-          return "decode opkey or opvalue failed";
+        Expected<RecordKey> opkey =
+            RecordKey::decode(entry.value().getOpKey());
+        if (!opkey.ok()) {
+          std::cerr << "decode opkey failed, err:" << opkey.status().toString()
+            << std::endl;
+          return "RecordKey::decode failed.";
         }
-        std::cout << "  op:" << (uint32_t)entry.value().getOp()
-                  << " fkey:" << opkey.value().getPrimaryKey()
-                  << " skey:" << opkey.value().getSecondaryKey()
-                  << " opvalue:" << opvalue.value().getValue() << std::endl;
+        if (entry.value().getOp() == ReplOp::REPL_OP_DEL) {
+          std::cout << "  op:" << (uint32_t)entry.value().getOp()
+            << " fkey:" << opkey.value().getPrimaryKey()
+            << " skey:" << opkey.value().getSecondaryKey()
+            << std::endl;
+        } else {
+          Expected<RecordValue> opvalue =
+              RecordValue::decode(entry.value().getOpValue());
+          if (!opvalue.ok()) {
+            std::cerr << "decode opvalue failed, err:"
+              << opvalue.status().toString() << std::endl;
+            return "RecordValue::decode failed.";
+          }
+          std::cout << "  op:" << (uint32_t)entry.value().getOp()
+            << " fkey:" << opkey.value().getPrimaryKey()
+            << " skey:" << opkey.value().getSecondaryKey()
+            << " opvalue:" << opvalue.value().getValue()
+            << std::endl;
+        }
       }
     } else if (_mode == TOOL_MODE::BASE64_SHOW) {
       std::string baseKey =
@@ -118,6 +135,11 @@ class BinlogScanner {
       }
       _lastbinlogid = logkey.value().getBinlogId();
       _lastbinlogtime = logValue.value().getTimestamp();
+    } else if (_mode == TOOL_MODE::AOF_SHOW) {
+      std::stringstream ss;
+      std::string cmdStr = logValue.value().getCmd();
+
+      std::cout << "aof:" << std::endl << cmdStr << std::endl;
     }
 
     return "";

@@ -87,11 +87,10 @@ class SortCommand : public Command {
       return byRv.status();
     }
     auto byStore = expdb.value().store;
-    auto byExptxn = byStore->createTransaction(sess);
+    auto byExptxn = sess->getCtx()->createTransaction(byStore);
     if (!byExptxn.ok()) {
       return byExptxn.status();
     }
-    std::unique_ptr<Transaction> ROTxn = std::move(byExptxn.value());
 
     if (fieldKey.size() != 0) {
       RecordKey hashRk(expdb.value().chunkId,
@@ -99,7 +98,7 @@ class SortCommand : public Command {
                        RecordType::RT_HASH_ELE,
                        metaKey,
                        fieldKey);
-      auto hashVal = byStore->getKV(hashRk, ROTxn.get());
+      auto hashVal = byStore->getKV(hashRk, byExptxn.value());
       if (!hashVal.ok()) {
         return hashVal.status();
       }
@@ -107,7 +106,7 @@ class SortCommand : public Command {
     } else {
       RecordKey kvRk(
         expdb.value().chunkId, pCtx->getDbId(), RecordType::RT_KV, metaKey, "");
-      auto kvVal = byStore->getKV(kvRk, ROTxn.get());
+      auto kvVal = byStore->getKV(kvRk, byExptxn.value());
       if (!kvVal.ok()) {
         return kvVal.status();
       }
@@ -135,6 +134,37 @@ class SortCommand : public Command {
     return 1;
   }
 
+  std::vector<int> getKeysFromCommand(const std::vector<std::string>& argv) {
+    uint32_t i, j;
+    std::vector<int> keys;
+
+    keys.push_back(1); /* <sort-key> is always present. */
+
+    /* Search for STORE option. By default we consider options to don't
+     * have arguments, so if we find an unknown option name we scan the
+     * next. However there are options with 1 or 2 arguments, so we
+     * provide a list here in order to skip the right number of args. */
+    struct {
+      std::string name;
+      int skip;
+    } skiplist[] = {
+      {"limit", 2}, {"get", 1}, {"by", 1}, {"", 0} /* End of elements. */
+    };
+
+    for (i = 2; i < argv.size(); i++) {
+      for (j = 0; skiplist[j].name != ""; j++) {
+        if (toLower(argv[i]) == skiplist[j].name) {
+          i += skiplist[j].skip;
+          break;
+        } else if (toLower(argv[i]) == "store" && i + 1 < argv.size()) {
+          keys.push_back(i + 1); /* <store-key> */
+          break;
+        }
+      }
+    }
+    return keys;
+  }
+
   Expected<std::string> run(Session* sess) final {
     const auto& args = sess->getArgs();
     const auto& key = args[1];
@@ -143,6 +173,7 @@ class SortCommand : public Command {
     int32_t offset(-1), count(-1);
     size_t storeKeyIndex;
 
+    /* 1.precheck */
     std::vector<SortOp> ops(1);
     std::vector<int> iKey(1, 1);
     for (size_t i = 2; i < args.size(); i++) {
@@ -178,20 +209,16 @@ class SortCommand : public Command {
         } else {
           /* If BY is specified with a real patter, we can't accept
            * it in cluster mode. */
-          // below lines commented are port from redis-cluster
-          // disable to support cluster one shard mode
-          // if (server.cluster_enabled) {
-          //     addReplyError(c,"BY option of SORT denied in Cluster
-          //     mode."); syntax_error++; break;
-          // }
+          if (sess->getServerEntry()->isClusterEnabled()) {
+            return {ErrorCodes::ERR_PARSEOPT,
+                    "BY option of SORT denied in Cluster mode."};
+          }
         }
       } else if (!::strcasecmp(args[i].c_str(), "get") && leftargs >= 1) {
-        // below lines commented are port from redis-cluster
-        // disable to support cluster one shard mode
-        // if (server.cluster_enabled) {
-        //     addReplyError(c,"GET option of SORT denied in Cluster
-        //     mode."); syntax_error++; break;
-        // }
+        if (sess->getServerEntry()->isClusterEnabled()) {
+          return {ErrorCodes::ERR_PARSEOPT,
+                  "GET option of SORT denied in Cluster mode."};
+        }
         mystring_view cmd("get");
         ops.emplace_back(SortOp{
           "get",
@@ -204,19 +231,22 @@ class SortCommand : public Command {
       }
     }
 
-    // lock ONLY key's lock
-    // we guarentee the keylock will be released before this
-    // thread willing to aquire another lock.
+    /* 2. lock all keys expect [Get pattern] */
     auto server = sess->getServerEntry();
     auto pCtx = sess->getCtx();
-    auto expdb =
-      server->getSegmentMgr()->getDbWithKeyLock(sess, key, Command::RdLock());
-    if (!expdb.ok()) {
-      return expdb.status();
-    }
+    auto keyidx = getKeysFromCommand(sess->getArgs());
+    auto expdblist = server->getSegmentMgr()->getAllKeysLocked(
+      sess,
+      sess->getArgs(),
+      keyidx,
+      store ? mgl::LockMode::LOCK_X : Command::RdLock());
+    RET_IF_ERR_EXPECTED(expdblist);
+
+    auto expdb = server->getSegmentMgr()->getDbHasLocked(sess, key);
+    RET_IF_ERR_EXPECTED(expdb);
     PStore kvstore = expdb.value().store;
 
-
+    /* 3. Get the sort key and length */
     auto expRv =
       Command::expireKeyIfNeeded(sess, key, RecordType::RT_DATA_META);
     if (expRv.status().code() == ErrorCodes::ERR_EXPIRED ||
@@ -326,11 +356,10 @@ class SortCommand : public Command {
     std::vector<Element> records;
     records.reserve(veclen);
 
-    auto ptxn = kvstore->createTransaction(sess);
+    auto ptxn = sess->getCtx()->createTransaction(kvstore);
     if (!ptxn.ok()) {
       return ptxn.status();
     }
-    std::unique_ptr<Transaction> txn = std::move(ptxn.value());
 
     if (keyType == RecordType::RT_LIST_META) {
       uint64_t pos(0), stop(0);
@@ -360,7 +389,7 @@ class SortCommand : public Command {
                         RecordType::RT_LIST_ELE,
                         key,
                         std::to_string(pos));
-        Expected<RecordValue> expRv = kvstore->getKV(subRk, txn.get());
+        Expected<RecordValue> expRv = kvstore->getKV(subRk, ptxn.value());
         if (!expRv.ok()) {
           return expRv.status();
         }
@@ -368,7 +397,7 @@ class SortCommand : public Command {
         pos += sign;
       }
     } else if (keyType == RecordType::RT_SET_META) {
-      auto cursor = txn->createDataCursor();
+      auto cursor = ptxn.value()->createDataCursor();
       RecordKey fakeRk = {expdb.value().chunkId,
                           pCtx->getDbId(),
                           RecordType::RT_SET_ELE,
@@ -396,7 +425,7 @@ class SortCommand : public Command {
         pos = start;
         rangeLen = veclen;
       }
-      auto arr = sl->scanByRank(pos, rangeLen, desc, txn.get());
+      auto arr = sl->scanByRank(pos, rangeLen, desc, ptxn.value());
       if (!arr.ok()) {
         return arr.status();
       }
@@ -407,11 +436,7 @@ class SortCommand : public Command {
       INVARIANT_D(0);
     }
 
-    // release key lock.
-    // older expdb, pstore, txn should not been used till then.
-    expdb.value().keyLock.reset(nullptr);
-
-    // aquire all op's(include BY) lock.
+    /* 4. Handle by pattern|get pattern, get opkeys  */
     std::vector<std::string> opkeys;
     std::vector<int32_t> opidx;
     size_t lockidx(0);
@@ -436,9 +461,13 @@ class SortCommand : public Command {
       }
     }
 
+    /* It disable get pattern|by pattern when cluster_enabled is yes */
+    INVARIANT_D(!server->isClusterEnabled() || opkeys.size() == 0);
     // handle GET
     std::vector<std::string> result;
     {
+      /* When cluster_enabled is yes, opkeys is always empty. It is only
+       * compatible with when cluster_enable is no */
       auto locklist = server->getSegmentMgr()->getAllKeysLocked(
         sess, opkeys, opidx, Command::RdLock());
 
@@ -551,26 +580,32 @@ class SortCommand : public Command {
       }
     }
 
+    /* 5. Handle store */
     if (store) {
-      auto addDb = server->getSegmentMgr()->getDbWithKeyLock(
-        sess, args[storeKeyIndex], mgl::LockMode::LOCK_X);
+      auto addDb =
+        server->getSegmentMgr()->getDbHasLocked(sess, args[storeKeyIndex]);
       if (!addDb.ok()) {
         return addDb.status();
       }
+      auto addStore = addDb.value().store;
+      auto addPtxn = sess->getCtx()->createTransaction(addStore);
+      if (!addPtxn.ok()) {
+        return addPtxn.status();
+      }
+
       auto expDone = Command::delKeyChkExpire(
-        sess, args[storeKeyIndex], RecordType::RT_DATA_META);
+        sess, args[storeKeyIndex], RecordType::RT_DATA_META, addPtxn.value());
       if (!expDone.ok()) {
         return expDone.status();
       }
       if (result.size() == 0) {
+        auto expCmt = sess->getCtx()->commitTransaction(addPtxn.value());
+        if (!expCmt.ok()) {
+          return expCmt.status();
+        }
         return Command::fmtZero();
       }
-      auto addStore = addDb.value().store;
-      auto addPtxn = addStore->createTransaction(sess);
-      if (!addPtxn.ok()) {
-        return addPtxn.status();
-      }
-      std::unique_ptr<Transaction> addTxn = std::move(addPtxn.value());
+
       RecordKey metaRk(addDb.value().chunkId,
                        pCtx->getDbId(),
                        RecordType::RT_LIST_META,
@@ -586,7 +621,7 @@ class SortCommand : public Command {
                         metaRk.getPrimaryKey(),
                         std::to_string(idx++));
         RecordValue subRv(x, RecordType::RT_LIST_ELE, -1);
-        Status s = addStore->setKV(subRk, subRv, addTxn.get());
+        Status s = addStore->setKV(subRk, subRv, addPtxn.value());
         if (!s.ok()) {
           return s;
         }
@@ -596,12 +631,12 @@ class SortCommand : public Command {
                                  RecordValue(lm.encode(),
                                              RecordType::RT_LIST_META,
                                              pCtx->getVersionEP()),
-                                 addTxn.get());
+                                 addPtxn.value());
       if (!s.ok()) {
         return s;
       }
 
-      auto expCmt = addTxn->commit();
+      auto expCmt = sess->getCtx()->commitTransaction(addPtxn.value());
       if (!expCmt.ok()) {
         return expCmt.status();
       }

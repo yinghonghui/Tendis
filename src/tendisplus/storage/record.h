@@ -19,15 +19,21 @@
 
 namespace tendisplus {
 
-#define VERSIONMETA_CHUNKID 0XFFFE0000U
-#define TTLINDEX_CHUNKID 0XFFFF0000U
-#define REPLLOGKEY_CHUNKID 0XFFFFFF00U
-#define REPLLOGKEYV2_CHUNKID 0XFFFFFF01U
+const uint32_t VERSIONMETA_CHUNKID = 0XFFFE0000U;
+const uint32_t ADMINCMD_CHUNKID = 0XFFFE0001U;
+const uint32_t TTLINDEX_CHUNKID = 0XFFFF0000U;
+// NOTE(takenliu) data chunkid must smaller than REPLLOGKEYV2_META_CHUNKID
+const uint32_t REPLLOGKEYV2_META_CHUNKID = 0XFFFFFE01U;
+const uint32_t REPLLOGKEY_CHUNKID = 0XFFFFFF00U;
+const uint32_t REPLLOGKEYV2_CHUNKID = 0XFFFFFF01U;
 
-#define VERSIONMETA_DBID 0XFFFE0000U
-#define TTLINDEX_DBID 0XFFFF0000U
-#define REPLLOGKEY_DBID 0XFFFFFF00U
-#define REPLLOGKEYV2_DBID 0XFFFFFF01U
+const uint32_t VERSIONMETA_DBID = 0XFFFE0000U;
+const uint32_t ADMINCMD_DBID = 0XFFFE0001U;
+const uint32_t TTLINDEX_DBID = 0XFFFF0000U;
+// NOTE(takenliu) data dbid must smaller than REPLLOGKEYV2_META_DBID
+const uint32_t REPLLOGKEYV2_META_DBID = 0XFFFFFE01U;
+const uint32_t REPLLOGKEY_DBID = 0XFFFFFF00U;
+const uint32_t REPLLOGKEYV2_DBID = 0XFFFFFF01U;
 
 /* NOTE(vinchen): if you want to add new RecordType, make sure you handle
    the below functions correctly.
@@ -147,6 +153,7 @@ class RecordKey {
     return PK_OFFSET;
   }
   bool operator==(const RecordKey& other) const;
+  bool operator!=(const RecordKey& other) const;
 
   static constexpr size_t CHUNKID_OFFSET = 0;
   static constexpr size_t TYPE_OFFSET = CHUNKID_OFFSET + sizeof(uint32_t);
@@ -250,6 +257,9 @@ class RecordValue {
 
   static constexpr size_t TYPE_OFFSET = 0;
   static constexpr size_t TTL_OFFSET = TYPE_OFFSET + sizeof(uint8_t);
+  uint64_t getEleCnt() const;
+  RecordType getEleType() const;
+  bool isBigKey(uint64_t valueSize, uint64_t eleCnt) const;
 
  private:
   // if RecordKey._type = META, _typeForMeta means the real

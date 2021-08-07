@@ -25,7 +25,7 @@ namespace tendisplus {
 
 class BackupCommand : public Command {
  public:
-  BackupCommand() : Command("backup", "a") {}
+  BackupCommand() : Command("backup", "as") {}
 
   ssize_t arity() const {
     return -2;
@@ -64,8 +64,8 @@ class BackupCommand : public Command {
       auto tmpDirPath = dir + "/tmpDir";
       filesystem::create_directory(tmpDirPath);
       filesystem::remove(tmpDirPath);
-    } catch (const filesystem::filesystem_error &e) {
-        return {ErrorCodes::ERR_MANUAL, e.what()};
+    } catch (const filesystem::filesystem_error& e) {
+      return {ErrorCodes::ERR_MANUAL, e.what()};
     }
 
     if (!filesystem::exists(dir)) {
@@ -132,7 +132,7 @@ class BackupCommand : public Command {
 
 class RestoreBackupCommand : public Command {
  public:
-  RestoreBackupCommand() : Command("restorebackup", "aw") {}
+  RestoreBackupCommand() : Command("restorebackup", "aws") {}
 
   ssize_t arity() const {
     return -3;
@@ -201,7 +201,7 @@ class RestoreBackupCommand : public Command {
         return {ErrorCodes::ERR_INTERNAL, "has slave, rm slave first"};
       }
       LOG(INFO) << "restorebackup store:" << storeId << " isForce:" << isForce
-        << " isEmpty:" << isEmpty(svr, sess, storeId);
+                << " isEmpty:" << isEmpty(svr, sess, storeId);
       auto ret = restoreBackup(svr, sess, storeId, dir);
       if (!ret.ok()) {
         return ret.status();
@@ -272,8 +272,8 @@ class RestoreBackupCommand : public Command {
     uint32_t flags = 0;
     BinlogVersion mybversion = svr->getCatalog()->getBinlogVersion();
     LOG(INFO) << "store: " << storeId
-      << " binlogVersion:" << static_cast<int>(binlogVersion)
-      << " mybversion:" << static_cast<int>(mybversion);
+              << " binlogVersion:" << static_cast<int>(binlogVersion)
+              << " mybversion:" << static_cast<int>(mybversion);
     if (binlogVersion == BinlogVersion::BINLOG_VERSION_1) {
       if (mybversion == BinlogVersion::BINLOG_VERSION_2) {
         flags |= ROCKS_FLAGS_BINLOGVERSION_CHANGED;
@@ -310,7 +310,7 @@ class RestoreBackupCommand : public Command {
 // fullSync storeId dstStoreId ip port
 class FullSyncCommand : public Command {
  public:
-  FullSyncCommand() : Command("fullsync", "a") {}
+  FullSyncCommand() : Command("fullsync", "as") {}
 
   ssize_t arity() const {
     return 4;
@@ -341,7 +341,7 @@ class FullSyncCommand : public Command {
 
 class QuitCommand : public Command {
  public:
-  QuitCommand() : Command("quit", "a") {}
+  QuitCommand() : Command("quit", "as") {}
 
   ssize_t arity() const {
     return 0;
@@ -372,7 +372,7 @@ class QuitCommand : public Command {
 
 class ToggleIncrSyncCommand : public Command {
  public:
-  ToggleIncrSyncCommand() : Command("toggleincrsync", "a") {}
+  ToggleIncrSyncCommand() : Command("toggleincrsync", "as") {}
 
   ssize_t arity() const {
     return 2;
@@ -407,7 +407,7 @@ class ToggleIncrSyncCommand : public Command {
 
 class IncrSyncCommand : public Command {
  public:
-  IncrSyncCommand() : Command("incrsync", "a") {}
+  IncrSyncCommand() : Command("incrsync", "as") {}
 
   ssize_t arity() const {
     return 6;
@@ -629,20 +629,20 @@ class ApplyBinlogsGeneric : public Command {
     }
 
     // add binlog
-    auto ptxn = store->createTransaction(sess);
+    auto ptxn = sess->getCtx()->createTransaction(store);
     if (!ptxn.ok()) {
       LOG(ERROR) << "createTransaction failed:" << ptxn.status().toString();
       return ptxn.status();
     }
-    std::unique_ptr<Transaction> txn = std::move(ptxn.value());
 
     uint64_t binlogId = key.value().getBinlogId();
     // store the binlog directly, same as master
-    auto s = txn->setBinlogKV(binlogId, logKey, logValue);
+    auto s = ptxn.value()->setBinlogKV(binlogId, logKey, logValue);
     if (!s.ok()) {
       return s;
     }
-    Expected<uint64_t> expCmit = txn->commit();
+    Expected<uint64_t> expCmit =
+      sess->getCtx()->commitTransaction(ptxn.value());
     if (!expCmit.ok()) {
       return expCmit.status();
     }
@@ -713,7 +713,7 @@ class ApplyBinlogsCommandV2 : public ApplyBinlogsGeneric {
  public:
   ApplyBinlogsCommandV2()
     : ApplyBinlogsGeneric(
-        "applybinlogsv2", "aw", BinlogApplyMode::KEEP_BINLOG_ID) {}
+        "applybinlogsv2", "aws", BinlogApplyMode::KEEP_BINLOG_ID) {}
 
   ssize_t arity() const {
     return 5;
@@ -736,7 +736,7 @@ class MigrateBinlogsCommand : public ApplyBinlogsGeneric {
  public:
   MigrateBinlogsCommand()
     : ApplyBinlogsGeneric(
-        "migratebinlogs", "aw", BinlogApplyMode::NEW_BINLOG_ID) {}
+        "migratebinlogs", "aws", BinlogApplyMode::NEW_BINLOG_ID) {}
 
   ssize_t arity() const {
     return 5;
@@ -757,7 +757,7 @@ class MigrateBinlogsCommand : public ApplyBinlogsGeneric {
 
 class RestoreBinlogCommandV2 : public Command {
  public:
-  RestoreBinlogCommandV2() : Command("restorebinlogv2", "aw") {}
+  RestoreBinlogCommandV2() : Command("restorebinlogv2", "aws") {}
 
   ssize_t arity() const {
     return 4;
@@ -944,7 +944,7 @@ class RestoreBinlogCommandV2 : public Command {
 
 class restoreEndCommand : public Command {
  public:
-  restoreEndCommand() : Command("restoreend", "aw") {}
+  restoreEndCommand() : Command("restoreend", "aws") {}
 
   ssize_t arity() const {
     return 2;
@@ -994,7 +994,7 @@ class restoreEndCommand : public Command {
 
 class BinlogHeartbeatCommand : public Command {
  public:
-  BinlogHeartbeatCommand() : Command("binlog_heartbeat", "a") {}
+  BinlogHeartbeatCommand() : Command("binlog_heartbeat", "as") {}
 
   ssize_t arity() const {
     return -2;
@@ -1056,7 +1056,7 @@ class BinlogHeartbeatCommand : public Command {
 
 class MigateHeartbeatCommand : public Command {
  public:
-  MigateHeartbeatCommand() : Command("migrate_heartbeat", "a") {}
+  MigateHeartbeatCommand() : Command("migrate_heartbeat", "as") {}
 
   ssize_t arity() const {
     return 3;
@@ -1196,32 +1196,13 @@ class SlaveofCommand : public Command {
       if (storeId >= svr->getKVStoreCount()) {
         return {ErrorCodes::ERR_PARSEPKT, "invalid storeId"};
       }
-      // TODO(takenliu) add a command to delete dirty keys.
-      if (svr->isClusterEnabled()) {
-        auto clustermgr = svr->getClusterMgr();
-        if (clustermgr->hasDirtyKey(storeId)) {
-          return {ErrorCodes::ERR_INTERNAL,
-                  "slots not belong to me has some key, delete it "
-                  "please."};
-        }
-      }
+
       Status s = replMgr->changeReplSource(sess, storeId, "", 0, 0);
       if (!s.ok()) {
         return s;
       }
       return Command::fmtOK();
     } else {
-      // TODO(takenliu) add a command to delete dirty keys.
-      if (svr->isClusterEnabled()) {
-        auto clustermgr = svr->getClusterMgr();
-        for (uint32_t i = 0; i < svr->getKVStoreCount(); ++i) {
-          if (clustermgr->hasDirtyKey(i)) {
-            return {ErrorCodes::ERR_INTERNAL,
-                    "slots not belong to me has some key, delete "
-                    "it please."};
-          }
-        }
-      }
       for (uint32_t i = 0; i < svr->getKVStoreCount(); ++i) {
         Status s = replMgr->changeReplSource(sess, i, "", 0, 0);
         if (!s.ok()) {
@@ -1266,7 +1247,7 @@ class SlaveofCommand : public Command {
 
 class ReplStatusCommand : public Command {
  public:
-  ReplStatusCommand() : Command("replstatus", "a") {}
+  ReplStatusCommand() : Command("replstatus", "as") {}
 
   ssize_t arity() const {
     return 2;
@@ -1309,5 +1290,36 @@ class ReplStatusCommand : public Command {
     return Command::fmtLongLong((uint8_t)meta.value().get()->replState);
   }
 } replStatusCommand;
+
+class PsyncCommand : public Command {
+ public:
+  PsyncCommand() : Command("psync", "ars") {}
+
+  ssize_t arity() const {
+    return 4;
+  }
+
+  int32_t firstkey() const {
+    return 0;
+  }
+
+  int32_t lastkey() const {
+    return 0;
+  }
+
+  int32_t keystep() const {
+    return 0;
+  }
+
+  bool isBgCmd() const {
+    return true;
+  }
+
+  Expected<std::string> run(Session* sess) final {
+    LOG(FATAL) << "psync should not be called";
+    // void compiler complain
+    return {ErrorCodes::ERR_INTERNAL, "shouldn't be called"};
+  }
+} PsyncCommand;
 
 }  // namespace tendisplus

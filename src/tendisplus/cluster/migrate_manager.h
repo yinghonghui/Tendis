@@ -175,7 +175,7 @@ class MigrateManager {
   void stop();
 
   Status stopTasks(const std::string& taskid);
-  void stopAllTasks(bool saveSlots = true);
+  Status stopAllTasks(bool saveSlots = true);
   // sender POV
   bool senderSchedule(const SCLOCK::time_point& now);
 
@@ -216,7 +216,7 @@ class MigrateManager {
                    const std::shared_ptr<pTask> task,
                    bool import = false);
 
-  void insertNodes(const std::vector<uint32_t>& slots,
+  void insertNodes(const SlotsBitmap& slots,
                    const std::string& nodeid,
                    bool import);
   std::string getNodeIdBySlot(uint32_t, bool import = true);
@@ -325,7 +325,8 @@ class MigrateManager {
   std::map<uint32_t, std::list<SlotsBitmap>> _restoreMigrateTask;
 
   // sender's pov
-  std::map<std::string, std::unique_ptr<MigrateSendTask>> _migrateSendTaskMap;
+  std::unordered_map<std::string, std::unique_ptr<MigrateSendTask>>
+    _migrateSendTaskMap;
 
   std::unique_ptr<WorkerPool> _migrateSender;
   std::unique_ptr<WorkerPool> _migrateClear;
@@ -333,7 +334,7 @@ class MigrateManager {
   std::shared_ptr<PoolMatrix> _migrateClearMatrix;
 
   // receiver's pov
-  std::map<std::string, std::unique_ptr<MigrateReceiveTask>>
+  std::unordered_map<std::string, std::unique_ptr<MigrateReceiveTask>>
     _migrateReceiveTaskMap;
 
   std::unique_ptr<WorkerPool> _migrateReceiver;

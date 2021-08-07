@@ -36,7 +36,13 @@ struct SPovStatus {
   uint64_t sessionId;
   SCLOCK::time_point nextSchedTime;
   SCLOCK::time_point lastSyncTime;
-  uint64_t lastBinlogTs;    // in milliseconds
+  uint64_t lastBinlogTs;  // in milliseconds
+  uint32_t fullsyncSuccTimes;
+};
+
+enum class MPovClientType {
+  repllogClient = 0,
+  respClient = 1,  // resp = REdis Serialization Protocol
 };
 
 struct MPovStatus {
@@ -52,7 +58,9 @@ struct MPovStatus {
   uint64_t clientId = 0;
   string slave_listen_ip;
   uint16_t slave_listen_port = 0;
+  MPovClientType clientType = MPovClientType::repllogClient;
 };
+
 
 enum class FullPushState {
   PUSHING = 0,
@@ -149,7 +157,9 @@ class ReplManager {
                                 std::string ip,
                                 uint32_t port,
                                 uint32_t sourceStoreId,
-                                bool checkEmpty = true);
+                                bool checkEmpty = true,
+                                bool needLock = true,
+                                bool incrSync = false);
   bool supplyFullSync(asio::ip::tcp::socket sock,
                       const std::string& storeIdArg,
                       const std::string& slaveIpArg,
@@ -160,10 +170,24 @@ class ReplManager {
                         const std::string& binlogPosArg,
                         const std::string& listenIpArg,
                         const std::string& listenPortArg);
+
+  bool supplyFullPsync(asio::ip::tcp::socket sock, const string& storeIdArg);
+
+  void AddFakeFullPushStatus(
+          uint64_t offset, const std::string& ip, uint64_t port);
+  void DelFakeFullPushStatus(
+          const std::string& ip, uint64_t port);
+
   Status replicationSetMaster(std::string ip,
                               uint32_t port,
+                              bool checkEmpty = true,
+                              bool incrSync = false);
+  Status replicationSetMaster(std::string ip,
+                              uint32_t port,
+                              uint32_t storeid,
                               bool checkEmpty = true);
   Status replicationUnSetMaster();
+  Status replicationUnSetMaster(uint32_t storeid);
 #ifdef BINLOG_V1
   Status applyBinlogs(uint32_t storeId,
                       uint64_t sessionId,
@@ -198,9 +222,15 @@ class ReplManager {
   size_t incrPusherSize();
   size_t logRecycleSize();
 
+  std::string getRecycleBinlogStr(Session* sess) const;
   std::string getMasterHost() const;
+  std::string getMasterHost(uint32_t storeid) const;
+  std::vector<uint32_t> checkMasterHost(const std::string& hostname,
+                                        uint32_t port);
+
   uint32_t getMasterPort() const;
   uint64_t getLastSyncTime() const;
+  uint64_t getLastBinlogTs() const;
   uint64_t replicationGetOffset() const;
   uint64_t replicationGetMaxBinlogIdFromRocks() const;
   uint64_t replicationGetMaxBinlogId() const;
@@ -214,10 +244,15 @@ class ReplManager {
                              uint32_t storeId,
                              const string& slave_listen_ip,
                              uint16_t slave_listen_port);
+
+  void supplyFullPsyncRoutine(std::shared_ptr<BlockingTcpClient> client,
+                              uint32_t storeId);
+
   bool isFullSupplierFull() const;
 
   std::shared_ptr<BlockingTcpClient> createClient(const StoreMeta&,
-                                                  uint64_t timeoutMs = 1000);
+                                                  uint64_t timeoutMs = 1000,
+                                                  int64_t flags = 0);
   void slaveStartFullsync(const StoreMeta&);
   void slaveChkSyncStatus(const StoreMeta&);
   std::ofstream* getCurBinlogFs(uint32_t storeid);

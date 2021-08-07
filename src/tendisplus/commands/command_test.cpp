@@ -25,6 +25,9 @@
 
 namespace tendisplus {
 
+Expected<std::string> recordList2Aof(const std::list<Record>& list);
+Expected<std::string> key2Aof(Session* sess, const std::string& key);
+
 void testSetRetry(std::shared_ptr<ServerEntry> svr) {
   asio::io_context ioContext;
   asio::ip::tcp::socket socket(ioContext), socket1(ioContext);
@@ -164,6 +167,9 @@ TEST(Command, expire) {
   testExpire(server);
   testExpire1(server);
   testExpire2(server);
+  testExpireCommandWhenNoexpireTrue(server);
+  testExpireKeyWhenGet(server);
+  testExpireKeyWhenCompaction(server);
 
 #ifndef _WIN32
   server->stop();
@@ -539,6 +545,7 @@ void testScan(std::shared_ptr<ServerEntry> svr) {
   std::stringstream ss;
   Command::fmtMultiBulkLen(ss, 2);
   std::string cursor = getBulkValue(expect.value(), 0);
+  EXPECT_TRUE(tendisplus::stoull(cursor).ok());   // cursor must be an integer
   Command::fmtBulk(ss, cursor);
   Command::fmtMultiBulkLen(ss, 10);
   for (int i = 0; i < 10; ++i) {
@@ -562,6 +569,78 @@ void testScan(std::shared_ptr<ServerEntry> svr) {
     Command::fmtBulk(ss, tmp);
   }
   EXPECT_EQ(ss.str(), expect.value());
+
+
+  // case 2: hscan
+  sess.setArgs({"hmset",
+                "scanhash",
+                "a",
+                "b",
+                "c",
+                "d",
+                "e",
+                "f",
+                "g",
+                "h",
+                "i",
+                "j",
+                "k",
+                "l",
+                "m",
+                "n"});
+  expect = Command::runSessionCmd(&sess);
+  EXPECT_TRUE(expect.ok());
+  ss.str("");
+
+  // case 2.1: hscan from cursor 0
+  uint32_t count = 5;
+  uint32_t field_count = 7;
+  sess.setArgs({"hscan", "scanhash", "0", "count", std::to_string(count)});
+  expect = Command::runSessionCmd(&sess);
+  EXPECT_TRUE(expect.ok());
+  Command::fmtMultiBulkLen(ss, 2);
+  cursor = getBulkValue(expect.value(), 0);
+  EXPECT_TRUE(tendisplus::stoull(cursor).ok());
+  EXPECT_EQ(std::to_string(count + 1), cursor);
+  Command::fmtBulk(ss, cursor);
+  Command::fmtMultiBulkLen(ss, 2*count);
+  for (size_t i = 0; i < 2*count; ++i) {
+    std::string tmp;
+    tmp.push_back('a' + i);
+    Command::fmtBulk(ss, tmp);
+  }
+  EXPECT_EQ(ss.str(), expect.value());
+
+  // case 2.2: hscan from a invalid cursor
+  {
+    // "1" is invalid cursor, scan from "0"
+    sess.setArgs({"hscan", "scanhash", "1", "count", std::to_string(count)});
+    auto expect1 = Command::runSessionCmd(&sess);
+    EXPECT_TRUE(expect1.ok());
+    // The result is same with scan with "0"
+    EXPECT_EQ(expect.value(), expect1.value());
+  }
+
+  // case 2.3: hscan from last valid cursor
+  sess.setArgs({"hscan", "scanhash", cursor, "count", std::to_string(count)});
+  expect = Command::runSessionCmd(&sess);
+  EXPECT_TRUE(expect.ok()) << expect.status().toString();
+  ss.str("");
+  Command::fmtMultiBulkLen(ss, 2);
+  cursor = "0";
+  Command::fmtBulk(ss, cursor);
+  Command::fmtMultiBulkLen(ss, (field_count - count) * 2);
+  for (size_t i = 0; i < (field_count - count) * 2; ++i) {
+    std::string tmp;
+    tmp.push_back('a' + 2*count + i);
+    Command::fmtBulk(ss, tmp);
+  }
+  EXPECT_EQ(ss.str(), expect.value());
+
+  // case 2.4: hscan a string cursor
+  sess.setArgs({"hscan", "scanhash", "abcde", "count", "5"});
+  expect = Command::runSessionCmd(&sess);
+  EXPECT_FALSE(expect.ok());
 }
 
 void testMulti(std::shared_ptr<ServerEntry> svr) {
@@ -1061,19 +1140,20 @@ TEST(Command, slowlog) {
     return;
   }
 
-  fgets(line, sizeof(line) - 1, fp);
+  char *ptr;
+  ptr = fgets(line, sizeof(line) - 1, fp);
   EXPECT_STRCASEEQ(line, "[] config set slowlog-log-slower-than 0 \n");
-  fgets(line, sizeof(line) - 1, fp);
+  ptr = fgets(line, sizeof(line) - 1, fp);
   EXPECT_STRCASEEQ(line, "[] sadd ss a \n");
-  fgets(line, sizeof(line) - 1, fp);
+  ptr = fgets(line, sizeof(line) - 1, fp);
   EXPECT_STRCASEEQ(line, "[] set ss b \n");
-  fgets(line, sizeof(line) - 1, fp);
+  ptr = fgets(line, sizeof(line) - 1, fp);
   EXPECT_STRCASEEQ(line, "[] set ss1 b \n");
-  fgets(line, sizeof(line) - 1, fp);
+  ptr = fgets(line, sizeof(line) - 1, fp);
   EXPECT_STRCASEEQ(line, "[] config get slowlog-log-slower-than \n");
-  fgets(line, sizeof(line) - 1, fp);
+  ptr = fgets(line, sizeof(line) - 1, fp);
   EXPECT_STRCASEEQ(line, "[] config set slowlog-file-enabled 1 \n");
-  fgets(line, sizeof(line) - 1, fp);
+  ptr = fgets(line, sizeof(line) - 1, fp);
   EXPECT_STRCASEEQ(line, "[] set ss2 b \n");
   pclose(fp);
 }
@@ -1622,6 +1702,20 @@ void testCommandArray(std::shared_ptr<ServerEntry> svr,
 
   for (auto& args : arr) {
     sess.setArgs(args);
+
+    // need precheck for args check, after exp.ok(), can execute runSessionCmd()
+    // EXPECT_FALSE when !exp.ok()
+    auto exp = Command::precheck(&sess);
+    if (!exp.ok()) {
+      std::stringstream ss;
+      for (auto& str : args) {
+        ss << str << " ";
+      }
+      LOG(INFO) << ss.str() << "ERROR:" << exp.status().toString();
+      EXPECT_FALSE(exp.ok());
+      continue;
+    }
+
     auto expect = Command::runSessionCmd(&sess);
     if (!expect.ok()) {
       std::stringstream ss;
@@ -1653,6 +1747,49 @@ void testCommandArrayResult(
     auto ret = expect.value();
     EXPECT_EQ(p.second, ret);
   }
+}
+
+TEST(Command, syncversion) {
+  const auto guard = MakeGuard([] { destroyEnv(); });
+
+  EXPECT_TRUE(setupEnv());
+  auto cfg = makeServerParam();
+  cfg->kvStoreCount = 5;
+  auto server = makeServerEntry(cfg);
+
+  asio::io_context ioContext;
+  asio::ip::tcp::socket socket(ioContext);
+  NetSession sess(server, std::move(socket), 1, false, nullptr, nullptr);
+
+  sess.setArgs({"syncversion", "k", "?", "?", "v1"});
+  auto expect = Command::runSessionCmd(&sess);
+  EXPECT_TRUE(expect.ok());
+  EXPECT_EQ(expect.value(), "*2\r\n:-1\r\n:-1\r\n");
+
+  sess.setArgs({"syncversion", "k", "25000", "1", "v1"});
+  expect = Command::runSessionCmd(&sess);
+  EXPECT_TRUE(expect.ok());
+  EXPECT_EQ(expect.value(), Command::fmtOK());
+
+  sess.setArgs({"syncversion", "k", "?", "?", "v1"});
+  expect = Command::runSessionCmd(&sess);
+  EXPECT_TRUE(expect.ok());
+  EXPECT_EQ(expect.value(), "*2\r\n:25000\r\n:1\r\n");
+
+  sess.setArgs({"syncversion", "*", "?", "?", "v1"});
+  expect = Command::runSessionCmd(&sess);
+  EXPECT_TRUE(expect.ok());
+  EXPECT_EQ(expect.value(),
+            "*5\r\n*1\r\n*3\r\n$1\r\nk\r\n:25000\r\n:1\r\n"
+            "*1\r\n*3\r\n$1\r\nk\r\n:25000\r\n:1\r\n"
+            "*1\r\n*3\r\n$1\r\nk\r\n:25000\r\n:1\r\n"
+            "*1\r\n*3\r\n$1\r\nk\r\n:25000\r\n:1\r\n"
+            "*1\r\n*3\r\n$1\r\nk\r\n:25000\r\n:1\r\n");
+
+#ifndef _WIN32
+  server->stop();
+  EXPECT_EQ(server.use_count(), 1);
+#endif
 }
 
 TEST(Command, info) {
@@ -1836,6 +1973,128 @@ TEST(Command, revision) {
 #endif
 }
 
+
+AllKeys initData(std::shared_ptr<ServerEntry> server,
+                 uint32_t count,
+                 const char* key_suffix) {
+  auto ctx1 = std::make_shared<asio::io_context>();
+  auto sess1 = makeSession(server, ctx1);
+  WorkLoad work(server, sess1);
+  work.init();
+  auto maxEleCnt = 2500;
+
+  AllKeys all_keys;
+
+  auto kv_keys = work.writeWork(RecordType::RT_KV, count, 0, true, key_suffix);
+  all_keys.emplace_back(kv_keys);
+
+  auto list_keys = work.writeWork(
+    RecordType::RT_LIST_META, count, maxEleCnt, true, key_suffix);
+  all_keys.emplace_back(list_keys);
+
+  auto hash_keys = work.writeWork(
+    RecordType::RT_HASH_META, count, maxEleCnt, true, key_suffix);
+  all_keys.emplace_back(hash_keys);
+
+  auto set_keys =
+    work.writeWork(RecordType::RT_SET_META, count, maxEleCnt, true, key_suffix);
+  all_keys.emplace_back(set_keys);
+
+  auto zset_keys = work.writeWork(
+    RecordType::RT_ZSET_META, count, maxEleCnt, true, key_suffix);
+  all_keys.emplace_back(zset_keys);
+
+  for (const auto& keyset : all_keys) {
+    for (const auto& key : keyset) {
+      if (std::rand() % 3 == 0) {
+        auto ttl = std::rand() % 1000 + 1000;
+        sess1->setArgs({"expire", key, std::to_string(ttl)});
+        auto expect = Command::runSessionCmd(sess1.get());
+        EXPECT_TRUE(expect.ok());
+        EXPECT_EQ(expect.value(), Command::fmtOne());
+      }
+    }
+  }
+
+  return all_keys;
+}
+
+TEST(Command, restorevalue) {
+  const auto guard = MakeGuard([] { destroyEnv(); });
+
+  EXPECT_TRUE(setupEnv("restore1"));
+  auto port1 = 5438;
+  auto cfg1 = makeServerParam(port1, 0, "restore1");
+  auto server1 = makeServerEntry(cfg1);
+
+  EXPECT_TRUE(setupEnv("restore2"));
+  auto port2 = 5439;
+  auto cfg2 = makeServerParam(port2, 0, "restore2");
+  auto server2 = makeServerEntry(cfg2);
+
+  auto allkeys = initData(server1, 1000, "restorevalue_");
+
+  for (const auto& keyset : allkeys) {
+    for (const auto& key : keyset) {
+      asio::io_context ioContext;
+      asio::ip::tcp::socket socket(ioContext);
+      NoSchedNetSession sess(
+        server1, std::move(socket), 1, false, nullptr, nullptr);
+
+      sess.setArgs({"restorevalue", key});
+      auto expect = Command::runSessionCmd(&sess);
+      EXPECT_TRUE(expect.ok());
+      auto cmdvec = sess.getResponse();
+      cmdvec.emplace_back(expect.value());
+
+      asio::io_context ioContext2;
+      asio::ip::tcp::socket socket2(ioContext2);
+      NoSchedNetSession sess2(
+        server2, std::move(socket2), 1, false, nullptr, nullptr);
+
+      // skip the first and last cmd
+      for (uint32_t i = 1; i < cmdvec.size() - 1; i++) {
+        auto cmd = cmdvec[i];
+        sess2.setArgsFromAof(cmd);
+
+        auto expect = Command::runSessionCmd(&sess2);
+        EXPECT_TRUE(expect.ok());
+      }
+    }
+  }
+
+  // compare data
+  for (const auto& keyset : allkeys) {
+    for (const auto& key : keyset) {
+      asio::io_context ioContext;
+      asio::ip::tcp::socket socket(ioContext);
+      NoSchedNetSession sess(
+        server1, std::move(socket), 1, false, nullptr, nullptr);
+
+      auto keystr1 = key2Aof(&sess, key);
+      INVARIANT_D(keystr1.ok());
+
+      asio::io_context ioContext2;
+      asio::ip::tcp::socket socket2(ioContext2);
+      NoSchedNetSession sess2(
+        server2, std::move(socket2), 1, false, nullptr, nullptr);
+
+      auto keystr2 = key2Aof(&sess2, key);
+      INVARIANT_D(keystr2.ok());
+
+      EXPECT_EQ(keystr1.value(), keystr2.value());
+    }
+  }
+
+#ifndef _WIN32
+  server1->stop();
+  EXPECT_EQ(server1.use_count(), 1);
+
+  server2->stop();
+  EXPECT_EQ(server2.use_count(), 1);
+#endif
+}
+
 TEST(Command, dexec) {
   const auto guard = MakeGuard([] { destroyEnv(); });
 
@@ -1863,6 +2122,49 @@ TEST(Command, dexec) {
   server->stop();
   EXPECT_EQ(server.use_count(), 1);
 #endif
+}
+
+void testRocksOptionCommand(std::shared_ptr<ServerEntry> svr) {
+  asio::io_context ioContext;
+  asio::ip::tcp::socket socket(ioContext);
+  NetSession sess(svr, std::move(socket), 1, false, nullptr, nullptr);
+
+  sess.setArgs({"CONFIG", "SET", "rocks.max_background_compactions", "3"});
+  auto expect = Command::runSessionCmd(&sess);
+  EXPECT_TRUE(expect.ok());
+  for (uint32_t i = 0; i < svr->getKVStoreCount(); i++) {
+    auto exptDb = svr->getSegmentMgr()->getDb(&sess, 0, mgl::LockMode::LOCK_IS);
+    EXPECT_TRUE(exptDb.ok());
+
+    auto store = exptDb.value().store;
+    EXPECT_EQ(store->getOption("rocks.max_background_compactions"), 3);
+  }
+
+  sess.setArgs({"CONFIG", "SET", "rocks.max_open_files", "3000"});
+  expect = Command::runSessionCmd(&sess);
+  EXPECT_TRUE(expect.ok());
+  for (uint32_t i = 0; i < svr->getKVStoreCount(); i++) {
+    auto exptDb = svr->getSegmentMgr()->getDb(&sess, 0, mgl::LockMode::LOCK_IS);
+    EXPECT_TRUE(exptDb.ok());
+
+    auto store = exptDb.value().store;
+    EXPECT_EQ(store->getOption("rocks.max_open_files"), 3000);
+  }
+
+  sess.setArgs({"CONFIG", "SET", "rocks.max_open_files", "-1"});
+  expect = Command::runSessionCmd(&sess);
+  EXPECT_TRUE(expect.ok());
+  for (uint32_t i = 0; i < svr->getKVStoreCount(); i++) {
+    auto exptDb = svr->getSegmentMgr()->getDb(&sess, 0, mgl::LockMode::LOCK_IS);
+    EXPECT_TRUE(exptDb.ok());
+
+    auto store = exptDb.value().store;
+    EXPECT_EQ(store->getOption("rocks.max_open_files"), -1);
+  }
+
+  sess.setArgs({"CONFIG", "SET", "rocks.abc", "-1"});
+  expect = Command::runSessionCmd(&sess);
+  EXPECT_FALSE(expect.ok());
 }
 
 void testResizeCommand(std::shared_ptr<ServerEntry> svr) {
@@ -1899,6 +2201,15 @@ void testResizeCommand(std::shared_ptr<ServerEntry> svr) {
   expect = Command::runSessionCmd(&sess);
   EXPECT_EQ(svr->getParams()->migrateReceiveThreadnum, 8);
 
+  // index manager
+  sess.setArgs({"CONFIG", "SET", "scanJobCntIndexMgr", "8"});
+  expect = Command::runSessionCmd(&sess);
+  EXPECT_EQ(svr->getParams()->scanJobCntIndexMgr, 8);
+
+  sess.setArgs({"CONFIG", "SET", "delJobCntIndexMgr", "8"});
+  expect = Command::runSessionCmd(&sess);
+  EXPECT_EQ(svr->getParams()->delJobCntIndexMgr, 8);
+
   // total sleep 10s to wait thread resize ok
   sleep(10);
   EXPECT_EQ(svr->getReplManager()->incrPusherSize(), 8);
@@ -1908,6 +2219,8 @@ void testResizeCommand(std::shared_ptr<ServerEntry> svr) {
   EXPECT_EQ(svr->getMigrateManager()->migrateSenderSize(), 8);
   EXPECT_EQ(svr->getGcMgr()->garbageDeleterSize(), 8);
   EXPECT_EQ(svr->getMigrateManager()->migrateReceiverSize(), 8);
+  EXPECT_EQ(svr->getIndexMgr()->indexScannerSize(), 8);
+  EXPECT_EQ(svr->getIndexMgr()->keyDeleterSize(), 8);
 
   sess.setArgs({"CONFIG", "SET", "fullPushThreadnum", "1"});
   expect = Command::runSessionCmd(&sess);
@@ -1937,6 +2250,15 @@ void testResizeCommand(std::shared_ptr<ServerEntry> svr) {
   expect = Command::runSessionCmd(&sess);
   EXPECT_EQ(svr->getParams()->migrateReceiveThreadnum, 1);
 
+  // index manager
+  sess.setArgs({"CONFIG", "SET", "scanJobCntIndexMgr", "1"});
+  expect = Command::runSessionCmd(&sess);
+  EXPECT_EQ(svr->getParams()->scanJobCntIndexMgr, 1);
+
+  sess.setArgs({"CONFIG", "SET", "delJobCntIndexMgr", "1"});
+  expect = Command::runSessionCmd(&sess);
+  EXPECT_EQ(svr->getParams()->delJobCntIndexMgr, 1);
+
   // total sleep 10s to wait thread resize ok
   sleep(10);
   EXPECT_EQ(svr->getReplManager()->incrPusherSize(), 1);
@@ -1946,6 +2268,8 @@ void testResizeCommand(std::shared_ptr<ServerEntry> svr) {
   EXPECT_EQ(svr->getMigrateManager()->migrateSenderSize(), 1);
   EXPECT_EQ(svr->getGcMgr()->garbageDeleterSize(), 1);
   EXPECT_EQ(svr->getMigrateManager()->migrateReceiverSize(), 1);
+  EXPECT_EQ(svr->getIndexMgr()->indexScannerSize(), 1);
+  EXPECT_EQ(svr->getIndexMgr()->keyDeleterSize(), 1);
 }
 
 TEST(Command, resizeCommand) {
@@ -1962,6 +2286,202 @@ TEST(Command, resizeCommand) {
 #ifndef _WIN32
   getGlobalServer()->stop();
   EXPECT_EQ(getGlobalServer().use_count(), 1);
+#endif
+}
+
+TEST(Command, adminSet_Get_DelCommand) {
+  const auto guard = MakeGuard([] { destroyEnv(); });
+  EXPECT_TRUE(setupEnv());
+  auto cfg = makeServerParam();
+  cfg->kvStoreCount = 3;
+  auto server = makeServerEntry(cfg);
+
+  std::vector<std::vector<std::string>> wrongArr = {
+          {"ADMINSET"},
+          {"ADMINSET", "test"},
+
+          {"ADMINGET"},
+          {"ADMINGET", "test", "storeid",
+           std::to_string(cfg->kvStoreCount + 1)},
+          {"ADMINGET", "test", "storeid", "("},
+
+          {"ADMINDEL"},
+  };
+
+  std::vector<std::pair<std::vector<std::string>, std::string>> resultArr = {
+          {{"ADMINSET", "test", "xx"}, Command::fmtOK()},
+
+          {{"ADMINGET", "test"}, "*3\r\n*2\r\n$1\r\n0\r\n$2\r\nxx\r\n"
+               "*2\r\n$1\r\n1\r\n$2\r\nxx\r\n*2\r\n$1\r\n2\r\n$2\r\nxx\r\n"},
+          {{"ADMINGET", "test", "storeid", "2"},
+                "*1\r\n*2\r\n$1\r\n2\r\n$2\r\nxx\r\n"},
+
+          {{"ADMINDEL", "test"}, Command::fmtOne()},
+          {{"ADMINDEL", "test"}, Command::fmtZero()},
+          {{"ADMINGET", "test"}, "*3\r\n*2\r\n$1\r\n0\r\n$-1\r\n*2\r\n"
+                                 "$1\r\n1\r\n$-1\r\n*2\r\n$1\r\n2\r\n$-1\r\n"},
+  };
+
+  testCommandArray(server, wrongArr, true);
+  testCommandArrayResult(server, resultArr);
+
+#ifndef _WIN32
+  server->stop();
+  EXPECT_EQ(server.use_count(), 1);
+#endif
+}
+
+TEST(Command, rocksdbOptionsCommand) {
+  const auto guard = MakeGuard([]() { destroyEnv(); });
+  EXPECT_TRUE(setupEnv());
+  auto cfg = makeServerParam();
+
+  getGlobalServer() = makeServerEntry(cfg);
+
+  testRocksOptionCommand(getGlobalServer());
+
+#ifndef _WIN32
+  getGlobalServer()->stop();
+  EXPECT_EQ(getGlobalServer().use_count(), 1);
+#endif
+}
+
+
+void testSort(bool clusterEnabled) {
+  const auto guard = MakeGuard([] { destroyEnv(); });
+
+  EXPECT_TRUE(setupEnv());
+  auto cfg = makeServerParam();
+  cfg->clusterEnabled = clusterEnabled;
+  cfg->generalLog = true;
+  cfg->logLevel = "debug";
+  auto server = makeServerEntry(cfg);
+
+  asio::io_context ioContext;
+  asio::ip::tcp::socket socket(ioContext);
+  NetSession sess(server, std::move(socket), 1, false, nullptr, nullptr);
+
+  if (clusterEnabled) {
+    sess.setArgs({"cluster", "addslots", "{0..16383}"});
+    auto expect = Command::runSessionCmd(&sess);
+    EXPECT_TRUE(expect.ok());
+  }
+  std::this_thread::sleep_for(std::chrono::seconds(3));
+
+  // uid
+  sess.setArgs({"LPUSH", "uid", "2", "3", "1"});
+  auto expect = Command::runSessionCmd(&sess);
+  EXPECT_TRUE(expect.ok());
+
+  // name
+  sess.setArgs({"set", "user_name_1", "admin"});
+  expect = Command::runSessionCmd(&sess);
+  EXPECT_TRUE(expect.ok());
+  sess.setArgs({"set", "user_name_2", "jack"});
+  expect = Command::runSessionCmd(&sess);
+  EXPECT_TRUE(expect.ok());
+  sess.setArgs({"set", "user_name_3", "mary"});
+  expect = Command::runSessionCmd(&sess);
+  EXPECT_TRUE(expect.ok());
+
+  // level
+  sess.setArgs({"set", "user_level_1", "10"});
+  expect = Command::runSessionCmd(&sess);
+  EXPECT_TRUE(expect.ok());
+  sess.setArgs({"set", "user_level_2", "5"});
+  expect = Command::runSessionCmd(&sess);
+  EXPECT_TRUE(expect.ok());
+  sess.setArgs({"set", "user_level_3", "8"});
+  expect = Command::runSessionCmd(&sess);
+  EXPECT_TRUE(expect.ok());
+
+  // sort
+  sess.setArgs({"sort", "uid"});
+  expect = Command::runSessionCmd(&sess);
+  EXPECT_EQ(expect.value(), "*3\r\n$1\r\n1\r\n$1\r\n2\r\n$1\r\n3\r\n");
+
+  // sort by
+  sess.setArgs({"sort", "uid", "by", "user_level_*"});
+  expect = Command::runSessionCmd(&sess);
+  if (!clusterEnabled) {
+    EXPECT_EQ(expect.value(),
+              "*3\r\n$1\r\n2\r\n$1\r\n3\r\n$1\r\n1\r\n");
+  } else {
+    EXPECT_EQ(expect.status().toString(),
+              "-ERR BY option of SORT denied in Cluster mode.\r\n");
+  }
+
+  // sort get
+  sess.setArgs({"sort", "uid", "get", "user_name_*"});
+  expect = Command::runSessionCmd(&sess);
+  if (!clusterEnabled) {
+    EXPECT_EQ(expect.value(),
+              "*3\r\n$5\r\nadmin\r\n$4\r\njack\r\n$4\r\nmary\r\n");
+  } else {
+    EXPECT_EQ(expect.status().toString(),
+              "-ERR GET option of SORT denied in Cluster mode.\r\n");
+  }
+
+#ifndef _WIN32
+  server->stop();
+  EXPECT_EQ(server.use_count(), 1);
+#endif
+}
+
+TEST(Command, sort_cluster) {
+  testSort(false);
+  testSort(true);
+}
+
+// call dbsize and flushall at the same time
+TEST(Command, testDbsizeAndFlushall) {
+  const auto guard = MakeGuard([] { destroyEnv(); });
+
+  EXPECT_TRUE(setupEnv());
+
+  auto cfg = makeServerParam();
+  auto server = makeServerEntry(cfg);
+
+  testCommand(server);
+
+  std::thread thd1([&server]() {
+    for (int i = 0; i < 100; i++) {
+      asio::io_context ioContext;
+      asio::ip::tcp::socket socket(ioContext), socket1(ioContext);
+      NetSession sess(server, std::move(socket), 1, false, nullptr, nullptr);
+
+      sess.setArgs({"dbsize"});
+      auto expect = Command::runSessionCmd(&sess);
+      EXPECT_TRUE(expect.ok());
+      EXPECT_EQ(
+        ":0\r\n",
+        expect.value());
+    }
+  });
+
+  std::thread thd2([&server]() {
+    for (int i = 0; i < 10; i++) {
+      asio::io_context ioContext;
+      asio::ip::tcp::socket socket(ioContext), socket1(ioContext);
+      NetSession sess(server, std::move(socket), 1, false, nullptr, nullptr);
+
+      sess.setArgs({"flushall"});
+      auto expect = Command::runSessionCmd(&sess);
+      EXPECT_TRUE(expect.ok());
+      EXPECT_EQ(
+        "+OK\r\n",
+        expect.value());
+    }
+  });
+
+  thd1.join();
+  thd2.join();
+
+  remove(cfg->getConfFile().c_str());
+
+#ifndef _WIN32
+  server->stop();
+  EXPECT_EQ(server.use_count(), 1);
 #endif
 }
 
@@ -1990,5 +2510,7 @@ TEST(Command, renameCommand) {
   EXPECT_EQ(server.use_count(), 1);
 #endif
 }
+
+// NOTE(takenliu): don't add test here, and it before Command.renameCommand
 
 }  // namespace tendisplus

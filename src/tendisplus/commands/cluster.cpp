@@ -13,6 +13,7 @@
 #include <algorithm>
 #include <cctype>
 #include <vector>
+#include <random>
 #include <clocale>
 #include <map>
 #include <list>
@@ -114,20 +115,35 @@ class ClusterCommand : public Command {
         std::vector<std::string> vec(args.begin() + 4, args.end());
         /* CLUSTER SETSLOT retry nodename chunkid */
         std::bitset<CLUSTER_SLOTS> slotsMap;
+
         for (auto& vs : vec) {
-          Expected<int64_t> exptSlot = ::tendisplus::stoll(vs);
-          if (!exptSlot.ok()) {
-            return exptSlot.status();
+          if ((vs.find('{') != string::npos) &&
+              (vs.find('}') != string::npos)) {
+            auto eRange = getSlotRange(vs);
+            RET_IF_ERR_EXPECTED(eRange);
+
+            uint32_t start = eRange.value().first;
+            uint32_t end = eRange.value().second;
+
+            for (uint32_t i = start; i <= end; i++) {
+              slotsMap.set(i);
+            }
+          } else {
+            Expected<int64_t> exptSlot = ::tendisplus::stoll(vs);
+            RET_IF_ERR_EXPECTED(exptSlot);
+
+            int32_t slot = (int32_t)exptSlot.value();
+
+            if (slot > CLUSTER_SLOTS - 1 || slot < 0) {
+              LOG(ERROR) << "slot" << slot
+                         << " ERR Invalid or out of range slot ";
+              return {ErrorCodes::ERR_CLUSTER, "Invalid migrate slot position"};
+            }
+            slotsMap.set(slot);
           }
-          int32_t slot = (int32_t)exptSlot.value();
-          if (slot > CLUSTER_SLOTS - 1 || slot < 0) {
-            LOG(ERROR) << "slot" << slot
-                       << " ERR Invalid or out of range slot ";
-            return {ErrorCodes::ERR_CLUSTER, "Invalid migrate slot position"};
-          }
-          slotsMap.set(slot);
         }
-        bool needRetry = (arg2 == "restart") ? true : false;
+
+        bool needRetry = (arg2 == "restart");
         auto exptTaskid = startAllSlotsTasks(
           slotsMap, svr, nodeId, clusterState, srcNode, myself, needRetry);
         if (!exptTaskid.ok()) {
@@ -185,8 +201,7 @@ class ClusterCommand : public Command {
           }
         }
         if (!taskInfo.ok()) {
-          LOG(ERROR) << "get taskinfo fail:" << taskInfo.status().toString();
-          return taskInfo.status();
+          return Command::fmtNull();
         }
         return taskInfo.value();
       } else if (arg2 == "stop" && argSize > 3) {
@@ -222,6 +237,9 @@ class ClusterCommand : public Command {
           std::string nodeId = (*it).first;
           auto taskMap = (*it).second;
           auto srcNode = clusterState->clusterLookupNode(nodeId);
+          if (srcNode == nullptr) {
+            return {ErrorCodes::ERR_CLUSTER, "import node not find"};
+          }
           auto exptTaskid = startAllSlotsTasks(
             taskMap, svr, nodeId, clusterState, srcNode, myself, true);
           if (!exptTaskid.ok()) {
@@ -275,7 +293,7 @@ class ClusterCommand : public Command {
         return {ErrorCodes::ERR_CLUSTER,
                 "To set an arbiter, the node must be empty."};
       }
-      myself->_flags |= CLUSTER_NODE_ARBITER;
+      myself->setFlag(CLUSTER_NODE_ARBITER);
       LOG(INFO) << "set myself as arbiter";
       return Command::fmtOK();
     } else if (arg1 == "nodes" && argSize <= 3) {
@@ -299,36 +317,14 @@ class ClusterCommand : public Command {
       if (myself->nodeIsArbiter()) {
         return {ErrorCodes::ERR_CLUSTER, "Can not add/del slots on arbiter."};
       }
-
       for (size_t i = 2; i < argSize; ++i) {
         if ((args[i].find('{') != string::npos) &&
             (args[i].find('}') != string::npos)) {
-          std::string str = args[i];
-          str = str.substr(1, str.size() - 2);
+          auto eRange = getSlotRange(args[i]);
 
-          if (str.find("..") == std::string::npos) {
-            return {ErrorCodes::ERR_CLUSTER, "Invalid range input withot .."};
-          }
-          auto vs = stringSplit(str, "..");
-
-          if (vs.size() != 2) {
-            return {ErrorCodes::ERR_CLUSTER, "no find start and end position"};
-          }
-          auto startSlot = ::tendisplus::stoul(vs[0]);
-          auto endSlot = ::tendisplus::stoul(vs[1]);
-
-          if (!startSlot.ok() || !endSlot.ok()) {
-            LOG(ERROR) << "ERR Invalid or out of range slot ";
-            return {ErrorCodes::ERR_CLUSTER,
-                    "Invalid slot position " + args[i]};
-          }
-          uint32_t start = startSlot.value();
-          uint32_t end = endSlot.value();
-
-          if (end >= CLUSTER_SLOTS) {
-            return {ErrorCodes::ERR_CLUSTER,
-                    "Invalid slot position " + std::to_string(end)};
-          }
+          RET_IF_ERR_EXPECTED(eRange);
+          uint32_t start = eRange.value().first;
+          uint32_t end = eRange.value().second;
 
           if (svr->getParams()->clusterSingleNode &&
               (end - start) != (CLUSTER_SLOTS - 1)) {
@@ -345,10 +341,7 @@ class ClusterCommand : public Command {
         } else {
           auto slotInfo = ::tendisplus::stoul(args[i]);
 
-          if (!slotInfo.ok()) {
-            return {ErrorCodes::ERR_CLUSTER,
-                    "Invalid slot  specified " + args[i]};
-          }
+          RET_IF_ERR_EXPECTED(slotInfo);
           uint32_t slot = static_cast<uint32_t>(slotInfo.value());
           Status s = changeSlot(slot, arg1, svr, clusterState, myself);
           if (!s.ok()) {
@@ -388,9 +381,8 @@ class ClusterCommand : public Command {
         return {ErrorCodes::ERR_CLUSTER, "can not replicate to an arbiter."};
       }
       if (myself->nodeIsMaster() &&
-          (myself->getSlotNum() != 0 || nodeNotEmpty(svr, myself))) {
-        DLOG(INFO) << "nodeNotEmpty(svr, myself):" << nodeNotEmpty(svr, myself)
-                   << "myself slots:" << bitsetStrEncode(myself->getSlots());
+          (myself->getSlotNum() != 0 || !svr->isDbEmpty())) {
+        DLOG(INFO) << "myself slots:" << bitsetStrEncode(myself->getSlots());
         return {ErrorCodes::ERR_CLUSTER,
                 "To set a master the node must be empty"};
       }
@@ -436,7 +428,7 @@ class ClusterCommand : public Command {
       }
     } else if (arg1 == "flushslots" && argSize == 2) {
       //  db not empty
-      bool notEmpty = nodeNotEmpty(svr, myself);
+      bool notEmpty = !svr->isDbEmpty();
       if (notEmpty) {
         return {ErrorCodes::ERR_CLUSTER,
                 "DB must be empty to perform CLUSTER FLUSHSLOTS"};
@@ -457,7 +449,7 @@ class ClusterCommand : public Command {
       } else if (n == myself) {
         return {ErrorCodes::ERR_CLUSTER,
                 "I tried hard but I can't forget myself..."};
-      } else if (myself->nodeIsSlave() && myself->_slaveOf == n) {
+      } else if (myself->nodeIsSlave() && myself->getMaster() == n) {
         return {ErrorCodes::ERR_CLUSTER, "Can't forget my master!"};
       }
       clusterState->clusterBlacklistAddNode(n);
@@ -504,10 +496,14 @@ class ClusterCommand : public Command {
       }
       std::stringstream ss;
       uint16_t slavesNum = n->getSlaveNum();
+      auto expSlaveList = n->getSlaves();
+      if (slavesNum == 0 || !expSlaveList.ok()) {
+          return {ErrorCodes::ERR_CLUSTER, "have no slaves"};
+      }
+      auto slaveList = expSlaveList.value();
       Command::fmtMultiBulkLen(ss, slavesNum);
       for (size_t i = 0; i < slavesNum; i++) {
-        std::string nodeDescription =
-          clusterState->clusterGenNodeDescription(n->_slaves[i]);
+        std::string nodeDescription = slaveList[i]->genDescription();
         Command::fmtBulk(ss, nodeDescription);
       }
       return ss.str();
@@ -556,7 +552,7 @@ class ClusterCommand : public Command {
       }
       /* Slaves can be reset while containing data, but not master nodes
        * that must be empty. */
-      if (myself->nodeIsMaster() && nodeNotEmpty(svr, myself)) {
+      if (myself->nodeIsMaster() && !svr->isDbEmpty()) {
         return {ErrorCodes::ERR_CLUSTER,
                 "CLUSTER RESET can't be called with "
                 "master nodes containing keys"};
@@ -568,7 +564,7 @@ class ClusterCommand : public Command {
       }
       return Command::fmtOK();
     } else if (arg1 == "saveconfig" && argSize == 2) {
-      auto s = clusterState->clusterSaveConfig();
+      auto s = clusterState->clusterSaveNodes();
       if (!s.ok()) {
         return {ErrorCodes::ERR_CLUSTER,
                 "error saving the cluster node config" + s.toString()};
@@ -674,7 +670,8 @@ class ClusterCommand : public Command {
         }
       }
     } else {
-      LOG(ERROR) << "ERR Invalid or out of range slot";
+      LOG(ERROR) << "ERR Invalid or out of range slot from:" << start
+                 << "to:" << end;
       return {ErrorCodes::ERR_CLUSTER, "ERR Invalid or out of range slot"};
     }
     return {ErrorCodes::ERR_OK, "finish addslots"};
@@ -722,20 +719,6 @@ class ClusterCommand : public Command {
     return keysInfo.str();
   }
 
-  bool nodeNotEmpty(ServerEntry* svr, CNodePtr node) {
-    bool notEmpty = false;
-    auto slots = node->getSlots();
-    size_t idx = 0;
-    while (idx < slots.size()) {
-      if (slots.test(idx) && !svr->getClusterMgr()->emptySlot(idx)) {
-        notEmpty = true;
-        break;
-      }
-      ++idx;
-    }
-    return notEmpty;
-  }
-
   Expected<std::string> startImportingTasks(
     ServerEntry* svr,
     CNodePtr srcNode,
@@ -777,12 +760,26 @@ class ClusterCommand : public Command {
 
     const std::string& json = expRsp.value();
     rapidjson::Document doc;
+
+    struct taskinfo {
+      taskinfo(uint32_t storeid,
+               const SlotsBitmap& taskmap,
+               const std::string& taskid)
+        : _storeid(storeid), _taskmap(taskmap), _taskid(taskid) {}
+      uint32_t _storeid;
+      SlotsBitmap _taskmap;
+      std::string _taskid;
+    };
+
+    vector<taskinfo> taskInfoArray;
+
     doc.Parse(json);
     if (doc.HasParseError()) {
       LOG(ERROR) << "parse task failed"
                  << rapidjson::GetParseError_En(doc.GetParseError());
       return {ErrorCodes::ERR_NETWORK, "json parse fail"};
     }
+
     if (!doc.HasMember("errMsg"))
       return {ErrorCodes::ERR_DECODE, "json contain no errMsg"};
 
@@ -838,13 +835,25 @@ class ClusterCommand : public Command {
       if (!object["taskid"].IsString()) {
         return {ErrorCodes::ERR_WRONG_TYPE, "json taskid error type"};
       }
+
       auto myid = pTaskId + "-" + object["taskid"].GetString();
-      s =
-        migrateMgr->startTask(taskmap, ip, port, myid, storeid, pTaskPtr, true);
+      taskInfoArray.emplace_back(storeid, taskmap, myid);
+    }
+    /*NOTE(wayenchen) shuffle receiver task before starting*/
+    unsigned seed = TCLOCK::now().time_since_epoch().count();
+    shuffle(taskInfoArray.begin(),
+            taskInfoArray.end(),
+            std::default_random_engine(seed));
+
+    LOG(INFO) << "taskInfo array shuffle finished, tasksize is:"
+              << taskInfoArray.size();
+    for (auto& ele : taskInfoArray) {
+      s = migrateMgr->startTask(
+        ele._taskmap, ip, port, ele._taskid, ele._storeid, pTaskPtr, true);
       if (!s.ok()) {
         return {ErrorCodes::ERR_CLUSTER, "migrate receive start task fail"};
       }
-      migrateMgr->insertNodes(slotsVec, srcNode->getNodeName(), true);
+      migrateMgr->insertNodes(ele._taskmap, srcNode->getNodeName(), true);
     }
     migrateMgr->addImportPTask(pTaskPtr);
 
@@ -912,7 +921,7 @@ class ClusterCommand : public Command {
 
 class PrepareMigrateCommand : public Command {
  public:
-  PrepareMigrateCommand() : Command("preparemigrate", "a") {}
+  PrepareMigrateCommand() : Command("preparemigrate", "as") {}
 
   ssize_t arity() const {
     return 5;
@@ -944,7 +953,7 @@ class PrepareMigrateCommand : public Command {
 
 class ReadymigrateCommand : public Command {
  public:
-  ReadymigrateCommand() : Command("readymigrate", "a") {}
+  ReadymigrateCommand() : Command("readymigrate", "as") {}
 
   ssize_t arity() const {
     return 5;
@@ -1008,7 +1017,7 @@ class MigrateendCommand : public Command {
     std::string taskid = args[1];
     std::string sendBinlogResult = args[2];
 
-    bool finishBinlog = (sendBinlogResult == "+OK") ? true : false;
+    bool finishBinlog = (sendBinlogResult == "+OK");
     auto s = migrateMgr->supplyMigrateEnd(taskid, finishBinlog);
     if (!s.ok()) {
       return s;

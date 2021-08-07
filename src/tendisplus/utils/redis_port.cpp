@@ -8,6 +8,9 @@
 #include <stdarg.h>
 #include <sstream>
 #include <utility>
+#ifndef _WIN32
+#include "sys/time.h"
+#endif
 
 #include "glog/logging.h"
 #include "tendisplus/utils/invariant.h"
@@ -546,7 +549,7 @@ int zslParseRange(const char* min, const char* max, Zrangespec* spec) {
   return 0;
 }
 
-std::vector<std::string>* splitargs(std::vector<std::string>& result,   // NOLINT
+std::vector<std::string>* splitargs(std::vector<std::string>& result,  // NOLINT
                                     const std::string& lineStr) {
   const char* line = lineStr.c_str();
   const char* p = line;
@@ -1082,7 +1085,6 @@ int getCommandFlags(const char* sflags) {
 #define randomkeyCommand NULL
 #define selectCommand NULL
 #define swapdbCommand NULL
-#define moveCommand NULL
 #define renameCommand NULL
 #define renamenxCommand NULL
 #define expireCommand NULL
@@ -1241,11 +1243,41 @@ struct redisCommand redisCommandTable[] = {
   {"zremrangebyscore", zremrangebyscoreCommand, 4, "w", 0, NULL, 1, 1, 1, 0, 0},
   {"zremrangebyrank", zremrangebyrankCommand, 4, "w", 0, NULL, 1, 1, 1, 0, 0},
   {"zremrangebylex", zremrangebylexCommand, 4, "w", 0, NULL, 1, 1, 1, 0, 0},
-  {"zunionstore", zunionstoreCommand, -4, "wm", 0, zunionInterGetKeys, 0, 0, 0, 0, 0},    // NOLINT
-  {"zinterstore", zinterstoreCommand, -4, "wm", 0, zunionInterGetKeys, 0, 0, 0, 0, 0},    // NOLINT
+  {"zunionstore",
+   zunionstoreCommand,
+   -4,
+   "wm",
+   0,
+   zunionInterGetKeys,
+   0,
+   0,
+   0,
+   0,
+   0},  // NOLINT
+  {"zinterstore",
+   zinterstoreCommand,
+   -4,
+   "wm",
+   0,
+   zunionInterGetKeys,
+   0,
+   0,
+   0,
+   0,
+   0},  // NOLINT
   {"zrange", zrangeCommand, -4, "r", 0, NULL, 1, 1, 1, 0, 0},
   {"zrangebyscore", zrangebyscoreCommand, -4, "r", 0, NULL, 1, 1, 1, 0, 0},
-  {"zrevrangebyscore", zrevrangebyscoreCommand, -4, "r", 0, NULL, 1, 1, 1, 0, 0},    // NOLINT
+  {"zrevrangebyscore",
+   zrevrangebyscoreCommand,
+   -4,
+   "r",
+   0,
+   NULL,
+   1,
+   1,
+   1,
+   0,
+   0},  // NOLINT
   {"zrangebylex", zrangebylexCommand, -4, "r", 0, NULL, 1, 1, 1, 0, 0},
   {"zrevrangebylex", zrevrangebylexCommand, -4, "r", 0, NULL, 1, 1, 1, 0, 0},
   {"zcount", zcountCommand, 4, "rF", 0, NULL, 1, 1, 1, 0, 0},
@@ -1280,7 +1312,6 @@ struct redisCommand redisCommandTable[] = {
   {"randomkey", randomkeyCommand, 1, "rR", 0, NULL, 0, 0, 0, 0, 0},
   {"select", selectCommand, 2, "lF", 0, NULL, 0, 0, 0, 0, 0},
   {"swapdb", swapdbCommand, 3, "wF", 0, NULL, 0, 0, 0, 0, 0},
-  {"move", moveCommand, 3, "wF", 0, NULL, 1, 1, 1, 0, 0},
   {"rename", renameCommand, 3, "w", 0, NULL, 1, 2, 1, 0, 0},
   {"renamenx", renamenxCommand, 3, "wF", 0, NULL, 1, 2, 1, 0, 0},
   {"expire", expireCommand, 3, "wF", 0, NULL, 1, 1, 1, 0, 0},
@@ -1350,9 +1381,39 @@ struct redisCommand redisCommandTable[] = {
   {"command", commandCommand, 0, "lt", 0, NULL, 0, 0, 0, 0, 0},
   {"geoadd", geoaddCommand, -5, "wm", 0, NULL, 1, 1, 1, 0, 0},
   {"georadius", georadiusCommand, -6, "w", 0, georadiusGetKeys, 1, 1, 1, 0, 0},
-  {"georadius_ro", georadiusroCommand, -6, "r", 0, georadiusGetKeys, 1, 1, 1, 0, 0},    // NOLINT
-  {"georadiusbymember", georadiusbymemberCommand, -5, "w", 0, georadiusGetKeys, 1, 1, 1, 0, 0},  // NOLINT
-  {"georadiusbymember_ro", georadiusbymemberroCommand, -5, "r", 0, georadiusGetKeys, 1, 1, 1, 0, 0},  // NOLINT
+  {"georadius_ro",
+   georadiusroCommand,
+   -6,
+   "r",
+   0,
+   georadiusGetKeys,
+   1,
+   1,
+   1,
+   0,
+   0},  // NOLINT
+  {"georadiusbymember",
+   georadiusbymemberCommand,
+   -5,
+   "w",
+   0,
+   georadiusGetKeys,
+   1,
+   1,
+   1,
+   0,
+   0},  // NOLINT
+  {"georadiusbymember_ro",
+   georadiusbymemberroCommand,
+   -5,
+   "r",
+   0,
+   georadiusGetKeys,
+   1,
+   1,
+   1,
+   0,
+   0},  // NOLINT
   {"geohash", geohashCommand, -2, "r", 0, NULL, 1, 1, 1, 0, 0},
   {"geopos", geoposCommand, -2, "r", 0, NULL, 1, 1, 1, 0, 0},
   {"geodist", geodistCommand, -4, "r", 0, NULL, 1, 1, 1, 0, 0},
@@ -1437,6 +1498,236 @@ void serverLogOld(int level, const char* fmt, ...) {
       LOG(ERROR) << msg;
       break;
   }
+}
+
+void sha256_transform(SHA256_CTX* ctx, const BYTE data[]) {
+  WORD a, b, c, d, e, f, g, h, i, j, t1, t2, m[64];
+
+  for (i = 0, j = 0; i < 16; ++i, j += 4)
+    m[i] = (data[j] << 24) | (data[j + 1] << 16) | (data[j + 2] << 8) |
+      (data[j + 3]);
+  for (; i < 64; ++i)
+    m[i] = SIG1(m[i - 2]) + m[i - 7] + SIG0(m[i - 15]) + m[i - 16];
+
+  a = ctx->state[0];
+  b = ctx->state[1];
+  c = ctx->state[2];
+  d = ctx->state[3];
+  e = ctx->state[4];
+  f = ctx->state[5];
+  g = ctx->state[6];
+  h = ctx->state[7];
+
+  for (i = 0; i < 64; ++i) {
+    t1 = h + EP1(e) + CH(e, f, g) + k[i] + m[i];
+    t2 = EP0(a) + MAJ(a, b, c);
+    h = g;
+    g = f;
+    f = e;
+    e = d + t1;
+    d = c;
+    c = b;
+    b = a;
+    a = t1 + t2;
+  }
+
+  ctx->state[0] += a;
+  ctx->state[1] += b;
+  ctx->state[2] += c;
+  ctx->state[3] += d;
+  ctx->state[4] += e;
+  ctx->state[5] += f;
+  ctx->state[6] += g;
+  ctx->state[7] += h;
+}
+
+void sha256_init(SHA256_CTX* ctx) {
+  ctx->datalen = 0;
+  ctx->bitlen = 0;
+  ctx->state[0] = 0x6a09e667;
+  ctx->state[1] = 0xbb67ae85;
+  ctx->state[2] = 0x3c6ef372;
+  ctx->state[3] = 0xa54ff53a;
+  ctx->state[4] = 0x510e527f;
+  ctx->state[5] = 0x9b05688c;
+  ctx->state[6] = 0x1f83d9ab;
+  ctx->state[7] = 0x5be0cd19;
+}
+
+void sha256_update(SHA256_CTX* ctx, const BYTE data[], size_t len) {
+  WORD i;
+
+  for (i = 0; i < len; ++i) {
+    ctx->data[ctx->datalen] = data[i];
+    ctx->datalen++;
+    if (ctx->datalen == 64) {
+      sha256_transform(ctx, ctx->data);
+      ctx->bitlen += 512;
+      ctx->datalen = 0;
+    }
+  }
+}
+
+void sha256_final(SHA256_CTX* ctx, BYTE hash[]) {
+  WORD i;
+
+  i = ctx->datalen;
+
+  // Pad whatever data is left in the buffer.
+  if (ctx->datalen < 56) {
+    ctx->data[i++] = 0x80;
+    while (i < 56)
+      ctx->data[i++] = 0x00;
+  } else {
+    ctx->data[i++] = 0x80;
+    while (i < 64)
+      ctx->data[i++] = 0x00;
+    sha256_transform(ctx, ctx->data);
+    memset(ctx->data, 0, 56);
+  }
+
+  // Append to the padding the total message's length in bits and transform.
+  ctx->bitlen += ctx->datalen * 8;
+  ctx->data[63] = ctx->bitlen;
+  ctx->data[62] = ctx->bitlen >> 8;
+  ctx->data[61] = ctx->bitlen >> 16;
+  ctx->data[60] = ctx->bitlen >> 24;
+  ctx->data[59] = ctx->bitlen >> 32;
+  ctx->data[58] = ctx->bitlen >> 40;
+  ctx->data[57] = ctx->bitlen >> 48;
+  ctx->data[56] = ctx->bitlen >> 56;
+  sha256_transform(ctx, ctx->data);
+
+  // Since this implementation uses little endian byte ordering and SHA uses big
+  // endian, reverse all the bytes when copying the final state to the output
+  // hash.
+  for (i = 0; i < 4; ++i) {
+    hash[i] = (ctx->state[0] >> (24 - i * 8)) & 0x000000ff;
+    hash[i + 4] = (ctx->state[1] >> (24 - i * 8)) & 0x000000ff;
+    hash[i + 8] = (ctx->state[2] >> (24 - i * 8)) & 0x000000ff;
+    hash[i + 12] = (ctx->state[3] >> (24 - i * 8)) & 0x000000ff;
+    hash[i + 16] = (ctx->state[4] >> (24 - i * 8)) & 0x000000ff;
+    hash[i + 20] = (ctx->state[5] >> (24 - i * 8)) & 0x000000ff;
+    hash[i + 24] = (ctx->state[6] >> (24 - i * 8)) & 0x000000ff;
+    hash[i + 28] = (ctx->state[7] >> (24 - i * 8)) & 0x000000ff;
+  }
+}
+
+/* Get random bytes, attempts to get an initial seed from /dev/urandom and
+ * the uses a one way hash function in counter mode to generate a random
+ * stream. However if /dev/urandom is not available, a weaker seed is used.
+ *
+ * This function is not thread safe, since the state is global. */
+void getRandomBytes(unsigned char* p, size_t len) {
+  /* Global state. */
+  static int seed_initialized = 0;
+  static unsigned char seed[64]; /* 512 bit internal block size. */
+  static uint64_t counter = 0;   /* The counter we hash with the seed. */
+
+#ifdef _WIN32
+  if (!seed_initialized) {
+    for (unsigned int j = 0; j < sizeof(seed); j++) {
+      seed[j] = random();
+    }
+    seed_initialized = 1;
+  }
+#else
+  if (!seed_initialized) {
+    /* Initialize a seed and use SHA1 in counter mode, where we hash
+     * the same seed with a progressive counter. For the goals of this
+     * function we just need non-colliding strings, there are no
+     * cryptographic security needs. */
+    FILE* fp = fopen("/dev/urandom", "r");
+    if (fp == NULL || fread(seed, sizeof(seed), 1, fp) != 1) {
+      /* Revert to a weaker seed, and in this case reseed again
+       * at every call.*/
+      for (unsigned int j = 0; j < sizeof(seed); j++) {
+        struct timeval tv;
+        gettimeofday(&tv, NULL);
+        pid_t pid = getpid();
+        seed[j] = tv.tv_sec ^ tv.tv_usec ^ pid ^ (int64_t)fp;
+      }
+    } else {
+      seed_initialized = 1;
+    }
+    if (fp)
+      fclose(fp);
+  }
+#endif
+
+  while (len) {
+    /* This implements SHA256-HMAC. */
+    unsigned char digest[SHA256_BLOCK_SIZE];
+    unsigned char kxor[64];
+    unsigned int copylen = len > SHA256_BLOCK_SIZE ? SHA256_BLOCK_SIZE : len;
+
+    /* IKEY: key xored with 0x36. */
+    memcpy(kxor, seed, sizeof(kxor));
+    for (unsigned int i = 0; i < sizeof(kxor); i++)
+      kxor[i] ^= 0x36;
+
+    /* Obtain HASH(IKEY||MESSAGE). */
+    SHA256_CTX ctx;
+    sha256_init(&ctx);
+    sha256_update(&ctx, kxor, sizeof(kxor));
+    sha256_update(&ctx, (unsigned char*)&counter, sizeof(counter));
+    sha256_final(&ctx, digest);
+
+    /* OKEY: key xored with 0x5c. */
+    memcpy(kxor, seed, sizeof(kxor));
+    for (unsigned int i = 0; i < sizeof(kxor); i++)
+      kxor[i] ^= 0x5C;
+
+    /* Obtain HASH(OKEY || HASH(IKEY||MESSAGE)). */
+    sha256_init(&ctx);
+    sha256_update(&ctx, kxor, sizeof(kxor));
+    sha256_update(&ctx, digest, SHA256_BLOCK_SIZE);
+    sha256_final(&ctx, digest);
+
+    /* Increment the counter for the next iteration. */
+    counter++;
+
+    memcpy(p, digest, copylen);
+    len -= copylen;
+    p += copylen;
+  }
+}
+
+/* Generate the Redis "Run ID", a SHA1-sized random number that identifies a
+ * given execution of Redis, so that if you are talking with an instance
+ * having run_id == A, and you reconnect and it has run_id == B, you can be
+ * sure that it is either a different instance or it was restarted. */
+void getRandomHexChars(char* p, size_t len) {
+  char charset[] = "0123456789abcdef";
+  size_t j;
+
+  getRandomBytes((unsigned char*)p, len);
+  for (j = 0; j < len; j++)
+    p[j] = charset[p[j] & 0x0F];
+}
+
+/* Modify the string substituting all the occurrences of the set of
+ * characters specified in the 'from' string to the corresponding character
+ * in the 'to' array.
+ *
+ * For instance: strmapchars(mystring, "ho", "01", 2)
+ * will have the effect of turning the string "hello" into "0ell1".
+ *
+ * The function returns the sds string pointer, that is always the same
+ * as the input pointer since no resize is needed. */
+void strmapchars(std::string& s, const char *from,      // NOLINT
+                 const char *to, size_t setlen) {
+  size_t j, i, l = s.length();
+
+  for (j = 0; j < l; j++) {
+    for (i = 0; i < setlen; i++) {
+      if (s[j] == from[i]) {
+        s[j] = to[i];
+        break;
+      }
+    }
+  }
+  return;
 }
 
 }  // namespace redis_port

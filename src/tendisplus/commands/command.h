@@ -51,11 +51,7 @@ class Command {
   bool isMultiKey() const;
   bool isWriteable() const;
   bool isAdmin() const;
-  static bool noExpire();
-  // will be LOCK_S when _noexpire set true.
-  // should use lock upgrade in the future.
   static mgl::LockMode RdLock();
-  static void setNoExpire(bool cfg);
   static void changeCommand(const string& renameCmdList, string mode);
   int getFlags() const;
   size_t getFlagsCount() const;
@@ -87,14 +83,16 @@ class Command {
                              const RecordKey& mk,
                              const RecordValue& val,
                              Transaction* txn);
-  static Status delKey(Session* sess, const std::string& key, RecordType tp);
+  static Status delKey(Session* sess, const std::string& key, RecordType tp,
+          Transaction* txn);
 
   // return true if exists and delete succ
   // return false if not exists
   // return error if has error
   static Expected<bool> delKeyChkExpire(Session* sess,
                                         const std::string& key,
-                                        RecordType tp);
+                                        RecordType tp,
+                                        Transaction* txn);
 
   static std::string fmtErr(const std::string& s);
   static std::string fmtNull();
@@ -123,7 +121,6 @@ class Command {
   static const uint32_t _maxUnseenCmdNum = 10000;
   static std::map<std::string, uint64_t> _unSeenCmds;
 
-  static bool _noexpire;
   static mgl::LockMode _expRdLk;
 
  private:
@@ -139,6 +136,12 @@ class Command {
                                      RecordType valueType,
                                      Transaction* txn,
                                      const TTLIndex* ictx = nullptr);
+
+  static Expected<string> delSubkeysRange(Session* sess,
+                                          uint32_t storeId,
+                                          const RecordKey& mk,
+                                          RecordType valueType,
+                                          Transaction* txn);
 
   static Expected<uint32_t> partialDelSubKeys(Session* sess,
                                               uint32_t storeId,

@@ -69,12 +69,33 @@ uint32_t sinceEpoch(const SCLOCK::time_point& tp) {
 }
 
 // timestamp in second
-std::string epochToDatetime(const time_t epoch) {
+std::string epochToDatetime(uint64_t epoch) {
   struct tm* dt, rt;
   char buffer[64];
-  dt = localtime_r(&epoch, &rt);
+  const time_t t = epoch;
+  dt = localtime_r(&t, &rt);
   strftime(buffer, sizeof(buffer), "%y-%m-%d %H:%M:%S", dt);
   return std::string(buffer);
+}
+
+std::string msEpochToDatetime(uint64_t msEpoch) {
+  return epochToDatetime(msEpoch / 1000);
+}
+
+std::string nsEpochToDatetime(uint64_t nsEpoch) {
+  return epochToDatetime(nsEpoch / 1000000000);
+}
+
+SCLOCK::time_point getGmtUtcTime() {
+  // get GMT UTC timepoint
+  std::chrono::time_point<TCLOCK, std::chrono::duration<uint64_t>> tp_seconds(
+            std::chrono::duration<uint64_t>(1));
+    TCLOCK::time_point tp(tp_seconds);
+  // convert system_clock to steady_clock
+  auto sdy_now = SCLOCK::now();
+  auto sys_now = TCLOCK::now();
+
+  return tp - sys_now + sdy_now;
 }
 
 }  // namespace tendisplus
